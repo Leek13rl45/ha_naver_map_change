@@ -78,11 +78,18 @@ def find_hass_frontend_path() -> str | None:
 
 
 def find_map_js_file(frontend_path: str) -> str | None:
+    """CARTO 타일 URL이 포함된 지도 JS 파일을 찾습니다."""
     try:
         for fname in os.listdir(frontend_path):
-            # 순수 .js 파일만 (*.js.map, *.js.br, *.js.gz, *.js.bak 제외)
-            if not fname.endswith(".js") or "." in fname[:-3]:
+            # .js 로 끝나고 .js 앞에 다른 확장자가 없는 파일만
+            # 예: 12122.abc.js → OK / 12122.abc.js.map → NO / 12122.abc.js.br → NO
+            if not fname.endswith(".js"):
                 continue
+            # .js.br .js.gz .js.map .js.bak 같은 이중확장자 제외
+            without_js = fname[:-3]  # .js 제거
+            if without_js.endswith((".br", ".gz", ".map", ".bak", ".LICENSE")):
+                continue
+
             full_path = os.path.join(frontend_path, fname)
             try:
                 with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
