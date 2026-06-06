@@ -7,10 +7,10 @@ import logging
 import os
 import re
 import shutil
+import sys
 import urllib.request
 import json
 
-import homeassistant.util.dt as dt_util
 from homeassistant.core import HomeAssistant, ServiceCall
 
 _LOGGER = logging.getLogger(__name__)
@@ -20,17 +20,8 @@ DOMAIN = "naver_map_change"
 # 네이버 지도 버전코드를 얻어오는 URL
 NAVER_MAP_STYLE_URL = "https://map.pstatic.net/nrb/styles/basic.json"
 
-# HA 프론트엔드 JS 경로 (HA 버전에 따라 다를 수 있음)
-HA_FRONTEND_JS_PATHS = [
-    "/usr/src/homeassistant/homeassistant/components/frontend/",
-    "/home/homeassistant/.local/lib/python3.12/site-packages/homeassistant/components/frontend/",
-    "/home/homeassistant/.local/lib/python3.11/site-packages/homeassistant/components/frontend/",
-    "/home/homeassistant/.local/lib/python3.10/site-packages/homeassistant/components/frontend/",
-]
-
-# 교체 대상 OSM 타일 URL 패턴
-OSM_TILE_PATTERN = r"https://\{s\}\.tile\.openstreetmap\.org/\{z\}/\{x\}/\{y\}\.png"
-OSM_TILE_FALLBACK = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+# 교체 대상 CARTO 타일 URL (실제 HA에서 사용하는 URL)
+CARTO_TILE_PATTERN = "basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}"
 
 
 def get_naver_version() -> str:
@@ -47,9 +38,9 @@ def get_naver_version() -> str:
                 _LOGGER.info("네이버 지도 버전코드 획득 성공: %s", version)
                 return version
     except Exception as err:
-        _LOGGER.warning("네이버 버전코드 획득 실패, 기본값 사용: %s", err)
+        _LOGGER.warning("네이버 버전코드 획득 실패: %s", err)
 
-    # 실패 시 fallback: 날짜 기반으로 pstatic URL 직접 조회
+    # fallback
     try:
         fallback_url = "https://map.pstatic.net/nrb/styles/basic.json?fmt=jpg&mt=bg.ol.ts.ar.lko"
         req = urllib.request.Request(fallback_url, headers={"User-Agent": "Mozilla/5.0"})
@@ -68,101 +59,112 @@ def build_naver_tile_url(version: str) -> str:
     """버전코드로 네이버 타일 URL을 생성합니다."""
     if version:
         return f"https://map.pstatic.net/nrb/styles/basic/{version}/{{z}}/{{x}}/{{y}}@2x.png?mt=bg.ol.ts.ar.lko"
-    # 버전코드 없이도 동작하는 대체 URL
     return "https://map.pstatic.net/nrb/styles/basic/latest/{z}/{x}/{y}@2x.png?mt=bg.ol.ts.ar.lko"
 
 
-def find_ha_frontend_path() -> str | None:
-    """HA 프론트엔드 JS 디렉토리를 찾습니다."""
-    # homeassistant 패키지 경로 동적 탐색
+def find_hass_frontend_path() -> str | None:
+    """hass_frontend 패키지 경로를 찾습니다."""
+    # 방법 1: import로 직접 찾기
     try:
-        import homeassistant
-        ha_path = os.path.dirname(homeassistant.__file__)
-        frontend_path = os.path.join(ha_path, "components", "frontend")
-        if os.path.isdir(frontend_path):
-            _LOGGER.debug("HA 프론트엔드 경로 발견: %s", frontend_path)
-            return frontend_path
-    except Exception as err:
-        _LOGGER.debug("동적 경로 탐색 실패: %s", err)
-
-    # 하드코딩 경로 fallback
-    for path in HA_FRONTEND_JS_PATHS:
+        import hass_frontend
+        path = os.path.join(os.path.dirname(hass_frontend.__file__), "frontend_latest")
         if os.path.isdir(path):
+            _LOGGER.info("hass_frontend 경로 발견: %s", path)
+            return path
+    except ImportError:
+        pass
+
+    # 방법 2: sys.path에서 탐색
+    for base in sys.path:
+        path = os.path.join(base, "hass_frontend", "frontend_latest")
+        if os.path.isdir(path):
+            _LOGGER.info("hass_frontend 경로 발견 (sys.path): %s", path)
+            return path
+
+    # 방법 3: Python 버전별 하드코딩 경로
+    for pyver in ["3.14", "3.13", "3.12", "3.11", "3.10"]:
+        path = f"/usr/local/lib/python{pyver}/site-packages/hass_frontend/frontend_latest"
+        if os.path.isdir(path):
+            _LOGGER.info("hass_frontend 경로 발견 (하드코딩): %s", path)
             return path
 
     return None
 
 
 def find_map_js_file(frontend_path: str) -> str | None:
-    """지도 관련 JS 파일을 찾습니다."""
-    for fname in os.listdir(frontend_path):
-        if fname.endswith(".js") and ("map" in fname.lower() or "chunk" in fname.lower()):
+    """CARTO 타일 URL이 포함된 지도 JS 파일을 찾습니다."""
+    try:
+        for fname in os.listdir(frontend_path):
+            if not fname.endswith(".js") or fname.endswith(".map"):
+                continue
             full_path = os.path.join(frontend_path, fname)
-            # 파일 내용에 OSM URL이 있는지 확인
             try:
                 with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
-                    if "tile.openstreetmap.org" in content or "openstreetmap" in content.lower():
-                        return full_path
+                if CARTO_TILE_PATTERN in content:
+                    _LOGGER.info("지도 JS 파일 발견: %s", fname)
+                    return full_path
             except Exception:
                 continue
+    except Exception as err:
+        _LOGGER.error("JS 파일 탐색 오류: %s", err)
     return None
 
 
 def patch_js_file(js_path: str, naver_url: str) -> bool:
-    """JS 파일에서 OSM URL을 네이버 URL로 교체합니다."""
+    """JS 파일에서 CARTO URL을 네이버 URL로 교체합니다."""
     backup_path = js_path + ".bak"
 
     try:
         with open(js_path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
 
-        # 이미 네이버 URL로 교체된 경우
+        # 이미 네이버로 교체된 경우 버전코드만 업데이트
         if "map.pstatic.net" in content:
-            _LOGGER.info("이미 네이버 지도가 적용되어 있습니다.")
-            # 버전코드만 업데이트
+            _LOGGER.info("이미 네이버 지도 적용됨 — 버전코드 업데이트")
             new_content = re.sub(
-                r"https://map\.pstatic\.net/nrb/styles/basic/[^/\"']*/\{z\}/\{x\}/\{y\}[^\"']*",
+                r"https://map\.pstatic\.net/nrb/styles/basic/[^/\"'`]*/\{z\}/\{x\}/\{y\}[^\"'`\s]*",
                 naver_url,
                 content
             )
         else:
-            # OSM URL을 네이버 URL로 교체
-            new_content = content.replace(
-                "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-                naver_url
-            )
-            new_content = new_content.replace(
-                "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-                naver_url
-            )
-            # 추가 패턴 처리
+            # CARTO URL → 네이버 URL 교체
+            # 패턴: https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}...
             new_content = re.sub(
-                r"https?://\{?s\}?\.?tile\.openstreetmap\.org/\{z\}/\{x\}/\{y\}\.png",
+                r"https://\{s\}\.basemaps\.cartocdn\.com/rastertiles/voyager/\{z\}/\{x\}/\{y\}[^\s\"'`]*",
+                naver_url,
+                content
+            )
+            # 서브도메인 없는 버전도 처리
+            new_content = re.sub(
+                r"https://basemaps\.cartocdn\.com/rastertiles/voyager/\{z\}/\{x\}/\{y\}[^\s\"'`]*",
+                naver_url,
+                new_content
+            )
+            # dark/light 버전도 처리
+            new_content = re.sub(
+                r"https://\{s\}\.basemaps\.cartocdn\.com/(?:dark_all|light_all)/\{z\}/\{x\}/\{y\}[^\s\"'`]*",
                 naver_url,
                 new_content
             )
 
         if new_content == content:
-            _LOGGER.warning("교체할 OSM URL을 찾지 못했습니다: %s", js_path)
+            _LOGGER.warning("교체할 CARTO URL을 찾지 못했습니다: %s", js_path)
             return False
 
-        # 백업 생성
+        # 백업 생성 (최초 1회)
         if not os.path.exists(backup_path):
             shutil.copy2(js_path, backup_path)
-            _LOGGER.info("원본 파일 백업: %s", backup_path)
+            _LOGGER.info("원본 백업 완료: %s", backup_path)
 
         with open(js_path, "w", encoding="utf-8") as f:
             f.write(new_content)
 
-        _LOGGER.info("JS 파일 교체 완료: %s", js_path)
+        _LOGGER.info("JS 파일 교체 완료: %s", os.path.basename(js_path))
         return True
 
     except PermissionError:
-        _LOGGER.error(
-            "파일 쓰기 권한 없음: %s\n"
-            "HA를 root 또는 적절한 권한으로 실행 중인지 확인하세요.", js_path
-        )
+        _LOGGER.error("파일 쓰기 권한 없음: %s", js_path)
         return False
     except Exception as err:
         _LOGGER.error("JS 파일 교체 중 오류: %s", err)
@@ -196,15 +198,12 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         naver_url = build_naver_tile_url(version)
         _LOGGER.info("적용할 네이버 타일 URL: %s", naver_url)
 
-        # 2. HA 프론트엔드 경로 탐색
-        frontend_path = await hass.async_add_executor_job(find_ha_frontend_path)
+        # 2. hass_frontend 경로 탐색
+        frontend_path = await hass.async_add_executor_job(find_hass_frontend_path)
         if not frontend_path:
-            _LOGGER.error(
-                "HA 프론트엔드 경로를 찾을 수 없습니다. "
-                "지원되는 설치 방법: HAOS, venv, Docker"
-            )
+            _LOGGER.error("hass_frontend 경로를 찾을 수 없습니다.")
             hass.components.persistent_notification.create(
-                "❌ 네이버 지도 적용 실패: 프론트엔드 경로를 찾을 수 없습니다.",
+                "❌ 네이버 지도 적용 실패: hass_frontend 경로를 찾을 수 없습니다.",
                 title="Naver Map Change",
                 notification_id="naver_map_change_error"
             )
@@ -215,8 +214,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         if not js_path:
             _LOGGER.error("지도 JS 파일을 찾을 수 없습니다: %s", frontend_path)
             hass.components.persistent_notification.create(
-                "❌ 네이버 지도 적용 실패: 지도 JS 파일을 찾을 수 없습니다.\n"
-                f"경로: {frontend_path}",
+                f"❌ 네이버 지도 적용 실패: 지도 JS 파일을 찾을 수 없습니다.\n경로: {frontend_path}",
                 title="Naver Map Change",
                 notification_id="naver_map_change_error"
             )
@@ -234,10 +232,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             )
             _LOGGER.info("네이버 지도 적용 성공!")
         else:
-            msg = (
-                "❌ 네이버 지도 적용 실패\n"
-                "로그를 확인하세요."
-            )
+            msg = "❌ 네이버 지도 적용 실패\n로그를 확인하세요."
 
         hass.components.persistent_notification.create(
             msg,
@@ -246,21 +241,20 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         )
 
     async def handle_restore_map(call: ServiceCall) -> None:
-        """원본(OSM) 지도 복원 서비스 핸들러."""
+        """원본(CARTO) 지도 복원 서비스 핸들러."""
         _LOGGER.info("=== 원본 지도 복원 서비스 시작 ===")
 
-        frontend_path = await hass.async_add_executor_job(find_ha_frontend_path)
+        frontend_path = await hass.async_add_executor_job(find_hass_frontend_path)
         if not frontend_path:
-            _LOGGER.error("프론트엔드 경로를 찾을 수 없습니다.")
+            _LOGGER.error("hass_frontend 경로를 찾을 수 없습니다.")
             return
 
         js_path = await hass.async_add_executor_job(find_map_js_file, frontend_path)
 
-        # 백업 파일로 복원
         if js_path:
             backup_path = js_path + ".bak"
         else:
-            # 이미 OSM으로 돌아간 경우 .bak 파일 탐색
+            # .bak 파일 탐색
             backup_path = None
             for fname in os.listdir(frontend_path):
                 if fname.endswith(".js.bak"):
@@ -270,21 +264,23 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
         if not backup_path or not os.path.exists(backup_path):
             hass.components.persistent_notification.create(
-                "⚠️ 백업 파일이 없습니다. 이미 원본 상태이거나 백업이 존재하지 않습니다.",
+                "⚠️ 백업 파일이 없습니다. 이미 원본 상태입니다.",
                 title="Naver Map Change",
                 notification_id="naver_map_change_restore"
             )
             return
 
         success = await hass.async_add_executor_job(restore_js_file, js_path)
-        msg = "✅ 원본 지도(OSM) 복원 완료!\n브라우저 캐시를 초기화(Ctrl+Shift+R)하세요." if success else "❌ 복원 실패. 로그를 확인하세요."
+        msg = (
+            "✅ 원본 지도(CARTO) 복원 완료!\n브라우저 캐시를 초기화(Ctrl+Shift+R)하세요."
+            if success else "❌ 복원 실패. 로그를 확인하세요."
+        )
         hass.components.persistent_notification.create(
             msg,
             title="Naver Map Change",
             notification_id="naver_map_change_restore"
         )
 
-    # 서비스 등록
     hass.services.async_register(DOMAIN, "apply", handle_apply_naver_map)
     hass.services.async_register(DOMAIN, "restore", handle_restore_map)
 
