@@ -80,7 +80,8 @@ def find_hass_frontend_path() -> str | None:
 def find_map_js_file(frontend_path: str) -> str | None:
     try:
         for fname in os.listdir(frontend_path):
-            if not fname.endswith(".js") or fname.endswith(".map"):
+            # 순수 .js 파일만 (*.js.map, *.js.br, *.js.gz, *.js.bak 제외)
+            if not fname.endswith(".js") or "." in fname[:-3]:
                 continue
             full_path = os.path.join(frontend_path, fname)
             try:
