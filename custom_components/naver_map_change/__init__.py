@@ -20,6 +20,7 @@ DOMAIN = "naver_map_change"
 
 NAVER_MAP_STYLE_URL = "https://map.pstatic.net/nrb/styles/basic.json"
 CARTO_TILE_PATTERN = "basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}"
+NAVER_TILE_PATTERN = "map.pstatic.net/nrb/styles/basic/"
 RETINA_PATTERN = '+(t.Browser.retina?"@2x.png":".png")'
 
 
@@ -97,7 +98,6 @@ def find_map_js_file(frontend_path: str, pattern: str) -> str | None:
         for fname in os.listdir(frontend_path):
             if not fname.endswith(".js"):
                 continue
-            # .js.br .js.gz .js.map .js.bak 등 이중확장자 제외
             without_js = fname[:-3]
             if without_js.endswith((".br", ".gz", ".map", ".bak", ".LICENSE")):
                 continue
@@ -106,7 +106,7 @@ def find_map_js_file(frontend_path: str, pattern: str) -> str | None:
                 with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
                 if pattern in content:
-                    _LOGGER.info("지도 JS 파일 발견: %s", fname)
+                    _LOGGER.info("지도 JS 파일 발견: %s (패턴: %s)", fname, pattern)
                     return full_path
             except Exception:
                 continue
@@ -116,11 +116,11 @@ def find_map_js_file(frontend_path: str, pattern: str) -> str | None:
 
 
 def patch_js_file(js_path: str, naver_url: str) -> bool:
-    """JS 파일에서 CARTO URL을 네이버 URL로 교체하고 brotli 압축합니다."""
+    """JS 파일에서 타일 URL을 네이버 URL로 교체하고 brotli 압축합니다."""
     try:
         import brotli
     except ImportError:
-        _LOGGER.error("brotli 패키지가 없습니다. pip install brotli 실행 후 재시도하세요.")
+        _LOGGER.error("brotli 패키지가 없습니다.")
         return False
 
     backup_path = js_path + ".bak"
@@ -129,27 +129,34 @@ def patch_js_file(js_path: str, naver_url: str) -> bool:
         with open(js_path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
 
-        # 이미 네이버로 교체된 경우 버전코드만 업데이트
-        if "map.pstatic.net" in content:
+        # 케이스 1: 이미 네이버 적용됨 → 버전코드만 업데이트
+        if NAVER_TILE_PATTERN in content:
             _LOGGER.info("이미 네이버 지도 적용됨 — 버전코드 업데이트")
             new_content = re.sub(
-                r"https://map\.pstatic\.net/nrb/styles/basic/[^/\"'`]*/\{z\}/\{x\}/\{y\}@2x\.png\?mt=bg\.ol\.ts\.ar\.lko",
+                r"https://map\.pstatic\.net/nrb/styles/basic/[^/]+/\{z\}/\{x\}/\{y\}@2x\.png\?mt=bg\.ol\.ts\.ar\.lko",
                 naver_url,
                 content
             )
-        else:
-            # 1단계: CARTO URL → 네이버 URL 교체
+            if new_content == content:
+                _LOGGER.info("버전코드 동일, 업데이트 불필요: %s", js_path)
+                return True  # 이미 최신 버전
+
+        # 케이스 2: CARTO URL → 네이버 URL 교체
+        elif CARTO_TILE_PATTERN in content:
+            version = naver_url.split("/basic/")[1].split("/")[0]
             new_content = content.replace(
                 "basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}",
-                f"map.pstatic.net/nrb/styles/basic/{naver_url.split('/basic/')[1].split('/')[0]}/{{z}}/{{x}}/{{y}}@2x.png?mt=bg.ol.ts.ar.lko"
+                f"map.pstatic.net/nrb/styles/basic/{version}/{{z}}/{{x}}/{{y}}@2x.png?mt=bg.ol.ts.ar.lko"
             )
-            # 2단계: retina 분기 코드 제거 (URL 뒤에 붙는 @2x.png 중복 방지)
-            new_content = new_content.replace(
-                '+(t.Browser.retina?"@2x.png":".png")', ""
-            )
+            # retina 분기 코드 제거
+            new_content = new_content.replace(RETINA_PATTERN, "")
+
+        else:
+            _LOGGER.warning("교체할 패턴을 찾지 못했습니다: %s", js_path)
+            return False
 
         if new_content == content:
-            _LOGGER.warning("교체할 패턴을 찾지 못했습니다: %s", js_path)
+            _LOGGER.warning("내용 변경 없음: %s", js_path)
             return False
 
         # 백업 생성 (최초 1회)
@@ -157,11 +164,9 @@ def patch_js_file(js_path: str, naver_url: str) -> bool:
             shutil.copy2(js_path, backup_path)
             _LOGGER.info("원본 백업 완료: %s", backup_path)
 
-        # JS 파일 저장
         with open(js_path, "w", encoding="utf-8") as f:
             f.write(new_content)
 
-        # brotli 압축 파일 재생성
         compressed = brotli.compress(new_content.encode("utf-8"))
         with open(js_path + ".br", "wb") as f:
             f.write(compressed)
@@ -208,12 +213,10 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     async def handle_apply_naver_map(call: ServiceCall) -> None:
         _LOGGER.info("=== 네이버 지도 교체 서비스 시작 ===")
 
-        # 1. 최신 버전코드 가져오기
         version = await hass.async_add_executor_job(get_naver_version)
         naver_url = build_naver_tile_url(version)
         _LOGGER.info("적용할 네이버 타일 URL: %s", naver_url)
 
-        # 2. frontend_latest + frontend_es5 경로 탐색
         frontend_dirs = await hass.async_add_executor_job(find_hass_frontend_dirs)
         if not frontend_dirs:
             _LOGGER.error("hass_frontend 경로를 찾을 수 없습니다.")
@@ -226,15 +229,13 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
         success_count = 0
         for frontend_path in frontend_dirs:
-            # 이미 네이버 적용된 경우 pstatic으로 탐색, 아니면 cartocdn으로 탐색
-            pattern = "map.pstatic.net" if True else CARTO_TILE_PATTERN
+            # CARTO 패턴 먼저 탐색, 없으면 이미 네이버 적용된 파일 탐색
             js_path = await hass.async_add_executor_job(
                 find_map_js_file, frontend_path, CARTO_TILE_PATTERN
             )
-            # CARTO 못 찾으면 이미 네이버로 교체된 파일 탐색
             if not js_path:
                 js_path = await hass.async_add_executor_job(
-                    find_map_js_file, frontend_path, "map.pstatic.net"
+                    find_map_js_file, frontend_path, NAVER_TILE_PATTERN
                 )
 
             if not js_path:
