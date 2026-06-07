@@ -3,6 +3,7 @@ Naver Map Change Integration for Home Assistant
 네이버 지도로 기본 지도 교체 + 버전코드 자동 갱신
 """
 
+import gzip
 import logging
 import os
 import re
@@ -21,7 +22,12 @@ DOMAIN = "naver_map_change"
 NAVER_MAP_STYLE_URL = "https://map.pstatic.net/nrb/styles/basic.json"
 CARTO_TILE_PATTERN = "basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}"
 NAVER_TILE_PATTERN = "map.pstatic.net/nrb/styles/basic/"
-RETINA_PATTERN = '+(t.Browser.retina?"@2x.png":".png")'
+RETINA_PATTERNS = [
+    '+(t.Browser.retina?"@2x.png":".png")',
+    '+(e.Browser.retina?"@2x.png":".png")',
+    '+(n.Browser.retina?"@2x.png":".png")',
+    '+(r.Browser.retina?"@2x.png":".png")',
+]
 
 
 def get_naver_version() -> str:
@@ -115,14 +121,30 @@ def find_map_js_file(frontend_path: str, pattern: str) -> str | None:
     return None
 
 
-def patch_js_file(js_path: str, naver_url: str) -> bool:
-    """JS 파일에서 타일 URL을 네이버 URL로 교체하고 brotli 압축합니다."""
+def recompress_js(js_path: str, content: str) -> None:
+    """JS 내용을 brotli + gzip 으로 재압축합니다."""
+    encoded = content.encode("utf-8")
+
+    # brotli
     try:
         import brotli
-    except ImportError:
-        _LOGGER.error("brotli 패키지가 없습니다.")
-        return False
+        with open(js_path + ".br", "wb") as f:
+            f.write(brotli.compress(encoded))
+        _LOGGER.info("br 재압축 완료: %s", os.path.basename(js_path))
+    except Exception as err:
+        _LOGGER.warning("br 압축 실패: %s", err)
 
+    # gzip
+    try:
+        with open(js_path + ".gz", "wb") as f:
+            f.write(gzip.compress(encoded))
+        _LOGGER.info("gz 재압축 완료: %s", os.path.basename(js_path))
+    except Exception as err:
+        _LOGGER.warning("gz 압축 실패: %s", err)
+
+
+def patch_js_file(js_path: str, naver_url: str) -> bool:
+    """JS 파일에서 타일 URL을 네이버 URL로 교체하고 br/gz 재압축합니다."""
     backup_path = js_path + ".bak"
 
     try:
@@ -139,7 +161,9 @@ def patch_js_file(js_path: str, naver_url: str) -> bool:
             )
             if new_content == content:
                 _LOGGER.info("버전코드 동일, 업데이트 불필요: %s", js_path)
-                return True  # 이미 최신 버전
+                # gz도 최신 상태인지 확인 후 재압축
+                recompress_js(js_path, new_content)
+                return True
 
         # 케이스 2: CARTO URL → 네이버 URL 교체
         elif CARTO_TILE_PATTERN in content:
@@ -148,8 +172,9 @@ def patch_js_file(js_path: str, naver_url: str) -> bool:
                 "basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}",
                 f"map.pstatic.net/nrb/styles/basic/{version}/{{z}}/{{x}}/{{y}}@2x.png?mt=bg.ol.ts.ar.lko"
             )
-            # retina 분기 코드 제거
-            new_content = new_content.replace(RETINA_PATTERN, "")
+            # retina 분기 코드 제거 (변수명 t/e/n/r 모두 대응)
+            for rp in RETINA_PATTERNS:
+                new_content = new_content.replace(rp, "")
 
         else:
             _LOGGER.warning("교체할 패턴을 찾지 못했습니다: %s", js_path)
@@ -167,11 +192,9 @@ def patch_js_file(js_path: str, naver_url: str) -> bool:
         with open(js_path, "w", encoding="utf-8") as f:
             f.write(new_content)
 
-        compressed = brotli.compress(new_content.encode("utf-8"))
-        with open(js_path + ".br", "wb") as f:
-            f.write(compressed)
+        recompress_js(js_path, new_content)
 
-        _LOGGER.info("JS + br 파일 교체 완료: %s", os.path.basename(js_path))
+        _LOGGER.info("JS 교체 완료: %s", os.path.basename(js_path))
         return True
 
     except PermissionError:
@@ -183,13 +206,7 @@ def patch_js_file(js_path: str, naver_url: str) -> bool:
 
 
 def restore_js_file(js_path: str) -> bool:
-    """백업에서 원본 JS 파일을 복원하고 brotli 재압축합니다."""
-    try:
-        import brotli
-    except ImportError:
-        _LOGGER.error("brotli 패키지가 없습니다.")
-        return False
-
+    """백업에서 원본 JS 파일을 복원하고 br/gz 재압축합니다."""
     backup_path = js_path + ".bak"
     if not os.path.exists(backup_path):
         return False
@@ -198,9 +215,7 @@ def restore_js_file(js_path: str) -> bool:
         shutil.copy2(backup_path, js_path)
         with open(js_path, "r", encoding="utf-8", errors="ignore") as f:
             content = f.read()
-        compressed = brotli.compress(content.encode("utf-8"))
-        with open(js_path + ".br", "wb") as f:
-            f.write(compressed)
+        recompress_js(js_path, content)
         _LOGGER.info("원본 복원 완료: %s", js_path)
         return True
     except Exception as err:
