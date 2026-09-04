@@ -1,0 +1,101 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "네이버 지도 교체",
+        "description": "기본 지도 제공자를 선택합니다. 기본값인 NAVER 는 문서화되지 않은 비공식 타일 엔드포인트를 사용하므로 예고 없이 변경·차단될 수 있습니다. 옵션에서 언제든 다른 제공자로 바꿀 수 있습니다.",
+        "data": {
+          "provider": "제공자"
+        },
+        "data_description": {
+          "provider": "NAVER 는 인증키가 필요 없습니다. VWorld 는 무료 인증키가 필요합니다. 사용자 지정은 임의의 XYZ 타일 URL 을 직접 입력합니다."
+        }
+      },
+      "provider": {
+        "title": "{provider}",
+        "description": "설정을 확인하기 위해 실제 타일 한 장을 받아옵니다. 이 검사는 이 Home Assistant 서버에서 제공자에 접속할 수 있다는 것까지만 보장합니다.",
+        "data": {
+          "api_key": "인증키",
+          "url_template": "타일 URL 템플릿",
+          "attribution": "출처 표기"
+        },
+        "data_description": {
+          "api_key": "서버에만 보관됩니다. 스타일 문서나 브라우저에는 절대 나타나지 않습니다.",
+          "url_template": "제공자의 XYZ 타일 URL 을 입력합니다. z, x, y 자리표시자를 중괄호로 감싸 포함해야 합니다.",
+          "attribution": "지도에 표시되는 문구입니다. 필요 없으면 비워 둡니다."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "제공자로부터 타일을 받아오지 못했습니다.",
+      "not_an_image": "제공자가 응답했지만 이미지가 아닙니다. VWorld 의 경우 대개 등록되지 않은 인증키입니다.",
+      "invalid_url_template": "타일 URL 템플릿에 값이 채워지지 않은 자리표시자가 있습니다. z, x, y 자리표시자가 필요합니다.",
+      "version_unavailable": "제공자의 버전코드를 읽지 못했습니다.",
+      "unknown_provider": "알 수 없는 제공자입니다."
+    },
+    "abort": {
+      "single_instance_allowed": "네이버 지도 교체가 이미 설정되어 있습니다.",
+      "unsupported_ha_version": "이 통합은 Home Assistant 2026.9.0 이상이 필요합니다. 그 이전 버전은 지도 구조가 달라 이 방식이 성립하지 않습니다.",
+      "unknown_provider": "알 수 없는 제공자입니다."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "네이버 지도 교체 옵션",
+        "description": "값을 바꾸면 통합이 다시 로드되고 타일 캐시가 비워집니다. 제공자 변경은 5분 안에, 또는 페이지를 새로 고치면 즉시 브라우저에 반영됩니다.",
+        "data": {
+          "provider": "제공자",
+          "api_key": "인증키",
+          "url_template": "타일 URL 템플릿",
+          "attribution": "출처 표기",
+          "dark_variant": "제공자에 다크 타일이 있으면 사용",
+          "cache_max_bytes": "타일 캐시 크기"
+        },
+        "data_description": {
+          "dark_variant": "NAVER 에는 다크 타일이 없어 라이트 타일을 그대로 사용합니다.",
+          "cache_max_bytes": "메모리에만 저장하며 디스크에는 아무것도 쓰지 않습니다."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "제공자로부터 타일을 받아오지 못했습니다.",
+      "not_an_image": "제공자가 응답했지만 이미지가 아닙니다. VWorld 의 경우 대개 등록되지 않은 인증키입니다.",
+      "invalid_url_template": "타일 URL 템플릿에 값이 채워지지 않은 자리표시자가 있습니다. z, x, y 자리표시자가 필요합니다.",
+      "version_unavailable": "제공자의 버전코드를 읽지 못했습니다.",
+      "unknown_provider": "알 수 없는 제공자입니다."
+    }
+  },
+  "services": {
+    "refresh_version": {
+      "name": "버전코드 갱신",
+      "description": "6시간 주기 갱신을 기다리지 않고 제공자의 현재 타일 버전코드를 즉시 가져옵니다. 버전과 변경 여부를 반환합니다."
+    },
+    "clear_cache": {
+      "name": "타일 캐시 비우기",
+      "description": "메모리에 있는 타일 캐시를 비웁니다. 비워진 바이트 수를 반환합니다."
+    }
+  },
+  "exceptions": {
+    "entry_not_loaded": {
+      "message": "네이버 지도 교체가 설정되지 않았거나 로드되지 않아 이 작업을 실행할 수 없습니다."
+    },
+    "unknown_provider": {
+      "message": "알 수 없는 지도 제공자 \"{provider}\" 입니다. 통합을 다시 설정하세요."
+    }
+  },
+  "issues": {
+    "version_unavailable": {
+      "title": "지도 버전코드를 읽지 못했습니다",
+      "description": "제공자의 버전코드를 가져오지 못해 기본 지도(OpenStreetMap)로 폴백했습니다. 보통 저절로 해소되며, 즉시 재시도하려면 \"버전코드 갱신\" 작업을 호출하세요."
+    },
+    "missing_token_store": {
+      "title": "지도 타일 인증을 사용할 수 없습니다",
+      "description": "코어 map_tiles 의 토큰 저장소를 찾지 못했습니다. 인증 없이 서빙하지 않고 타일 요청을 거부하며, 지도는 기본 지도로 폴백합니다. Home Assistant 버전과 함께 제보해 주세요."
+    },
+    "restart_required": {
+      "title": "제거를 마치려면 재시작이 필요합니다",
+      "description": "주입된 프론트엔드 모듈은 이미 해제됐지만, Home Assistant 는 실행 중에 HTTP 뷰를 해제할 수 없습니다. 타일·스타일 엔드포인트까지 정리하려면 Home Assistant 를 재시작하세요."
+    }
+  }
+}

@@ -1,14 +1,10 @@
-apply:
-  name: 네이버 지도 적용
-  description: >
-    HA 기본 지도(OpenStreetMap)를 네이버 지도로 교체합니다.
-    최신 버전코드를 자동으로 가져와 적용합니다.
-    적용 후 브라우저 캐시를 초기화(Ctrl+Shift+R)하세요.
+# The old apply / restore services are gone: no file is ever patched, so the
+# concept no longer exists (docs/03-REDESIGN-SPEC.md section 3.9).
+# Names and descriptions live in translations/{en,ko}.json under "services".
+# The core-only build-time translation file must not be used by a custom
+# integration (docs/02-HA-PLATFORM-2026.md section 4.5).
+refresh_version:
   fields: {}
 
-restore:
-  name: 원본 지도 복원
-  description: >
-    네이버 지도 적용 전 원본(OpenStreetMap) 지도로 복원합니다.
-    백업 파일이 존재하는 경우에만 동작합니다.
+clear_cache:
   fields: {}

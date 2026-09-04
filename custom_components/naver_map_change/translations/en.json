@@ -1,0 +1,101 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Naver Map Change",
+        "description": "Choose the basemap provider. The default, NAVER, uses an undocumented tile endpoint that can change or be blocked without notice; you can switch provider at any time from the options.",
+        "data": {
+          "provider": "Provider"
+        },
+        "data_description": {
+          "provider": "NAVER needs no key. VWorld needs a free key. Custom lets you enter any XYZ tile URL."
+        }
+      },
+      "provider": {
+        "title": "{provider}",
+        "description": "One real tile is fetched to check the settings. Note that this only proves this Home Assistant server can reach the provider.",
+        "data": {
+          "api_key": "API key",
+          "url_template": "Tile URL template",
+          "attribution": "Attribution"
+        },
+        "data_description": {
+          "api_key": "Kept on the server. It never appears in the style document or in the browser.",
+          "url_template": "The provider's XYZ tile URL, with the standard z, x and y placeholders in curly braces.",
+          "attribution": "Shown on the map. Leave empty if the provider requires none."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not fetch a tile from the provider.",
+      "not_an_image": "The provider answered, but not with an image. For VWorld this usually means the key is not registered.",
+      "invalid_url_template": "The tile URL template is missing a value. It must contain the z, x and y placeholders.",
+      "version_unavailable": "Could not read the provider's version code.",
+      "unknown_provider": "Unknown provider."
+    },
+    "abort": {
+      "single_instance_allowed": "Naver Map Change is already configured.",
+      "unsupported_ha_version": "This integration needs Home Assistant 2026.9.0 or newer, because the map is built differently in earlier releases.",
+      "unknown_provider": "Unknown provider."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Naver Map Change options",
+        "description": "Changing anything here reloads the integration and empties the tile cache. A provider switch reaches the browser within five minutes, or immediately after a page reload.",
+        "data": {
+          "provider": "Provider",
+          "api_key": "API key",
+          "url_template": "Tile URL template",
+          "attribution": "Attribution",
+          "dark_variant": "Use dark tiles when the provider has them",
+          "cache_max_bytes": "Tile cache size"
+        },
+        "data_description": {
+          "dark_variant": "NAVER has no dark tiles, so the light ones are reused.",
+          "cache_max_bytes": "In-memory only; nothing is written to disk."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not fetch a tile from the provider.",
+      "not_an_image": "The provider answered, but not with an image. For VWorld this usually means the key is not registered.",
+      "invalid_url_template": "The tile URL template is missing a value. It must contain the z, x and y placeholders.",
+      "version_unavailable": "Could not read the provider's version code.",
+      "unknown_provider": "Unknown provider."
+    }
+  },
+  "services": {
+    "refresh_version": {
+      "name": "Refresh version code",
+      "description": "Fetches the provider's current tile version code now, instead of waiting for the six hour refresh. Returns the version and whether it changed."
+    },
+    "clear_cache": {
+      "name": "Clear tile cache",
+      "description": "Empties the in-memory tile cache. Returns how many bytes were freed."
+    }
+  },
+  "exceptions": {
+    "entry_not_loaded": {
+      "message": "Naver Map Change is not set up or not loaded, so this action cannot run."
+    },
+    "unknown_provider": {
+      "message": "Unknown basemap provider \"{provider}\". Reconfigure the integration."
+    }
+  },
+  "issues": {
+    "version_unavailable": {
+      "title": "Could not read the map version code",
+      "description": "The provider's version code could not be fetched, so the basemap has fallen back to OpenStreetMap. This usually clears itself; call the \"Refresh version code\" action to retry now."
+    },
+    "missing_token_store": {
+      "title": "Map tile authentication is unavailable",
+      "description": "The core map_tiles token store could not be found, so tile requests are refused rather than served unauthenticated. The basemap falls back to the default map. Please report this with your Home Assistant version."
+    },
+    "restart_required": {
+      "title": "Restart to finish removing Naver Map Change",
+      "description": "The injected frontend module was removed already, but Home Assistant cannot unregister HTTP views at runtime. Restart Home Assistant to remove the tile and style endpoints as well."
+    }
+  }
+}
