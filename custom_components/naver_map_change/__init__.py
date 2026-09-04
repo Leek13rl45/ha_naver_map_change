@@ -1,302 +1,369 @@
-"""
-Naver Map Change Integration for Home Assistant
-네이버 지도로 기본 지도 교체 + 버전코드 자동 갱신
+"""The Naver Map Change integration.
+
+Replaces the Home Assistant basemap with a Korean provider without touching a
+single file outside ``/config``. Three pieces do the work:
+
+1. a tile proxy at ``/api/map_tiles/naver_map_change/{z}/{x}/{y}.png``,
+2. a MapLibre style endpoint at ``.../style/{light|dark}.json``,
+3. a ~40 line frontend module that rewrites the style URL core fetches.
+
+Everything lives inside this integration folder, so it survives a Home
+Assistant Core update - unlike the previous implementation, which rewrote the
+minified bundles of the installed frontend package and was erased by every
+update (docs/01-AS-IS-ANALYSIS.md, docs/02-HA-PLATFORM-2026.md section 2).
+Nothing in this integration reads, writes, backs up or compresses any file
+outside its own folder.
 """
 
-import gzip
+from __future__ import annotations
+
 import logging
-import os
-import re
-import shutil
-import sys
-import urllib.request
-import json
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from functools import partial
+from pathlib import Path
+from typing import Any
 
-from homeassistant.core import HomeAssistant, ServiceCall
-from homeassistant.components.persistent_notification import async_create
+from homeassistant.components.frontend import add_extra_js_url, remove_extra_js_url
+from homeassistant.components.http import StaticPathConfig
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import __version__ as HA_VERSION
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse, callback
+from homeassistant.exceptions import ConfigEntryError, ServiceValidationError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.typing import ConfigType
+
+from .cache import TileCache
+from .const import (
+    CACHE_MAX_BYTES,
+    CONF_API_KEY,
+    CONF_ATTRIBUTION,
+    CONF_CACHE_MAX_BYTES,
+    CONF_DARK_VARIANT,
+    CONF_PROVIDER,
+    CONF_URL_TEMPLATE,
+    DATA_REGISTERED,
+    DEFAULT_DARK_VARIANT,
+    DEFAULT_PROVIDER,
+    DOMAIN,
+    FRONTEND_SCRIPT,
+    FRONTEND_URL_PATH,
+    INTEGRATION_VERSION,
+    ISSUE_RESTART_REQUIRED,
+    ISSUE_VERSION_UNAVAILABLE,
+    SERVICE_CLEAR_CACHE,
+    SERVICE_REFRESH_VERSION,
+    VARIANT_DARK,
+    VERSION_REFRESH_INTERVAL,
+    VERSION_REFRESH_MIN_INTERVAL,
+)
+from .providers import (
+    PROVIDER_CUSTOM,
+    TileProvider,
+    TileUrlError,
+    async_fetch_tilejson_version,
+    build_tile_url,
+    get_provider,
+)
+from .view import UPSTREAM_TIMEOUT, async_register_views
 
 _LOGGER = logging.getLogger(__name__)
 
-DOMAIN = "naver_map_change"
+# No YAML configuration: everything is set up through the config flow.
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
-NAVER_MAP_STYLE_URL = "https://map.pstatic.net/nrb/styles/basic.json"
-CARTO_TILE_PATTERN = "basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}"
-NAVER_TILE_PATTERN = "map.pstatic.net/nrb/styles/basic/"
-RETINA_PATTERNS = [
-    '+(t.Browser.retina?"@2x.png":".png")',
-    '+(e.Browser.retina?"@2x.png":".png")',
-    '+(n.Browser.retina?"@2x.png":".png")',
-    '+(r.Browser.retina?"@2x.png":".png")',
-]
+type NaverMapConfigEntry = ConfigEntry[NaverMapRuntimeData]
 
 
-def get_naver_version() -> str:
-    """네이버 지도 API에서 최신 버전코드를 가져옵니다."""
-    try:
-        req = urllib.request.Request(NAVER_MAP_STYLE_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as response:
-            data = json.loads(response.read().decode("utf-8"))
-            version = data.get("version", "")
-            if version:
-                _LOGGER.info("네이버 지도 버전코드 획득 성공: %s", version)
-                return version
-    except Exception as err:
-        _LOGGER.warning("네이버 버전코드 획득 실패: %s", err)
+@dataclass
+class NaverMapRuntimeData:
+    """Everything the views need at request time.
 
-    try:
-        fallback_url = "https://map.pstatic.net/nrb/styles/basic.json?fmt=jpg&mt=bg.ol.ts.ar.lko"
-        req = urllib.request.Request(fallback_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as response:
-            raw = response.read().decode("utf-8")
-            match = re.search(r'"version"\s*:\s*"([^"]+)"', raw)
-            if match:
-                return match.group(1)
-    except Exception as err2:
-        _LOGGER.warning("fallback 버전코드 획득 실패: %s", err2)
+    Stored on ``entry.runtime_data`` rather than ``hass.data[DOMAIN]``, which is
+    the documented pattern since 2024.4 and is cleaned up on unload
+    (docs/02-HA-PLATFORM-2026.md section 4.3).
+    """
 
-    return ""
+    hass: HomeAssistant
+    provider: TileProvider
+    cache: TileCache
+    api_key: str | None = None
+    url_template: str | None = None
+    attribution: str | None = None
+    dark_variant: bool = DEFAULT_DARK_VARIANT
+    version: str | None = None
+    ha_version: str = HA_VERSION
+    _last_version_refresh: float | None = field(default=None, init=False, repr=False)
 
+    @property
+    def dark_template(self) -> str | None:
+        """Return the dark tile template, or None when there is none.
 
-def build_naver_tile_url(version: str) -> str:
-    if version:
-        return f"https://map.pstatic.net/nrb/styles/basic/{version}/{{z}}/{{x}}/{{y}}@2x.png?mt=bg.ol.ts.ar.lko"
-    return "https://map.pstatic.net/nrb/styles/basic/latest/{z}/{x}/{y}@2x.png?mt=bg.ol.ts.ar.lko"
+        Naver has no dark style family (docs/05 section 1), so this is None for
+        the default provider and the light tiles are reused.
+        """
+        if not self.dark_variant:
+            return None
+        return self.provider.url_template_dark
 
+    def template_for(self, variant: str) -> str | None:
+        """Return an explicit URL template override for this variant.
 
-def find_hass_frontend_dirs() -> list[str]:
-    """hass_frontend의 frontend_latest와 frontend_es5 경로를 모두 반환합니다."""
-    base = None
+        None means "use the provider's own template"; a string is either the
+        user's ``custom`` template or the provider's dark template.
+        """
+        if variant == VARIANT_DARK and self.dark_template:
+            return self.dark_template
+        if self.provider.id == PROVIDER_CUSTOM:
+            return self.url_template
+        return None
 
-    try:
-        import hass_frontend
-        base = os.path.dirname(hass_frontend.__file__)
-    except ImportError:
-        pass
-
-    if not base:
-        for pyver in ["3.14", "3.13", "3.12", "3.11", "3.10"]:
-            path = f"/usr/local/lib/python{pyver}/site-packages/hass_frontend"
-            if os.path.isdir(path):
-                base = path
-                break
-
-    if not base:
-        for b in sys.path:
-            path = os.path.join(b, "hass_frontend")
-            if os.path.isdir(path):
-                base = path
-                break
-
-    if not base:
-        return []
-
-    dirs = []
-    for sub in ["frontend_latest", "frontend_es5"]:
-        full = os.path.join(base, sub)
-        if os.path.isdir(full):
-            dirs.append(full)
-    return dirs
-
-
-def find_map_js_file(frontend_path: str, pattern: str) -> str | None:
-    """패턴이 포함된 JS 파일을 찾습니다."""
-    try:
-        for fname in os.listdir(frontend_path):
-            if not fname.endswith(".js"):
-                continue
-            without_js = fname[:-3]
-            if without_js.endswith((".br", ".gz", ".map", ".bak", ".LICENSE")):
-                continue
-            full_path = os.path.join(frontend_path, fname)
-            try:
-                with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
-                if pattern in content:
-                    _LOGGER.info("지도 JS 파일 발견: %s (패턴: %s)", fname, pattern)
-                    return full_path
-            except Exception:
-                continue
-    except Exception as err:
-        _LOGGER.error("JS 파일 탐색 오류: %s", err)
-    return None
-
-
-def recompress_js(js_path: str, content: str) -> None:
-    """JS 내용을 brotli + gzip 으로 재압축합니다."""
-    encoded = content.encode("utf-8")
-
-    # brotli
-    try:
-        import brotli
-        with open(js_path + ".br", "wb") as f:
-            f.write(brotli.compress(encoded))
-        _LOGGER.info("br 재압축 완료: %s", os.path.basename(js_path))
-    except Exception as err:
-        _LOGGER.warning("br 압축 실패: %s", err)
-
-    # gzip
-    try:
-        with open(js_path + ".gz", "wb") as f:
-            f.write(gzip.compress(encoded))
-        _LOGGER.info("gz 재압축 완료: %s", os.path.basename(js_path))
-    except Exception as err:
-        _LOGGER.warning("gz 압축 실패: %s", err)
-
-
-def patch_js_file(js_path: str, naver_url: str) -> bool:
-    """JS 파일에서 타일 URL을 네이버 URL로 교체하고 br/gz 재압축합니다."""
-    backup_path = js_path + ".bak"
-
-    try:
-        with open(js_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-
-        # 케이스 1: 이미 네이버 적용됨 → 버전코드만 업데이트
-        if NAVER_TILE_PATTERN in content:
-            _LOGGER.info("이미 네이버 지도 적용됨 — 버전코드 업데이트")
-            new_content = re.sub(
-                r"https://map\.pstatic\.net/nrb/styles/basic/[^/]+/\{z\}/\{x\}/\{y\}@2x\.png\?mt=bg\.ol\.ts\.ar\.lko",
-                naver_url,
-                content
+    def can_build_tile_urls(self) -> bool:
+        """Return whether a tile URL can be built with what we know now."""
+        try:
+            build_tile_url(
+                self.provider,
+                version=self.version,
+                api_key=self.api_key,
+                url_template=self.template_for("light"),
+                z=0,
+                x=0,
+                y=0,
+                ha_version=self.ha_version,
             )
-            if new_content == content:
-                _LOGGER.info("버전코드 동일, 업데이트 불필요: %s", js_path)
-                # gz도 최신 상태인지 확인 후 재압축
-                recompress_js(js_path, new_content)
-                return True
-
-        # 케이스 2: CARTO URL → 네이버 URL 교체
-        elif CARTO_TILE_PATTERN in content:
-            version = naver_url.split("/basic/")[1].split("/")[0]
-            new_content = content.replace(
-                "basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}",
-                f"map.pstatic.net/nrb/styles/basic/{version}/{{z}}/{{x}}/{{y}}@2x.png?mt=bg.ol.ts.ar.lko"
-            )
-            # retina 분기 코드 제거 (변수명 t/e/n/r 모두 대응)
-            for rp in RETINA_PATTERNS:
-                new_content = new_content.replace(rp, "")
-
-        else:
-            _LOGGER.warning("교체할 패턴을 찾지 못했습니다: %s", js_path)
+        except TileUrlError:
             return False
-
-        if new_content == content:
-            _LOGGER.warning("내용 변경 없음: %s", js_path)
-            return False
-
-        # 백업 생성 (최초 1회)
-        if not os.path.exists(backup_path):
-            shutil.copy2(js_path, backup_path)
-            _LOGGER.info("원본 백업 완료: %s", backup_path)
-
-        with open(js_path, "w", encoding="utf-8") as f:
-            f.write(new_content)
-
-        recompress_js(js_path, new_content)
-
-        _LOGGER.info("JS 교체 완료: %s", os.path.basename(js_path))
         return True
 
-    except PermissionError:
-        _LOGGER.error("파일 쓰기 권한 없음: %s", js_path)
-        return False
-    except Exception as err:
-        _LOGGER.error("JS 파일 교체 중 오류: %s", err)
-        return False
+    async def async_refresh_version(self) -> tuple[str | None, bool]:
+        """Refresh the upstream version code, returning (version, changed).
 
+        Data-driven rather than a function-name lookup (design decision D3): a
+        provider either has a ``version_meta_url`` to read a TileJSON
+        ``version`` from, or it has no version code at all. A failure returns
+        the last known good value and never interrupts the map.
+        """
+        self._last_version_refresh = time.monotonic()
+        if (meta_url := self.provider.version_meta_url) is None:
+            return None, False
 
-def restore_js_file(js_path: str) -> bool:
-    """백업에서 원본 JS 파일을 복원하고 br/gz 재압축합니다."""
-    backup_path = js_path + ".bak"
-    if not os.path.exists(backup_path):
-        return False
-
-    try:
-        shutil.copy2(backup_path, js_path)
-        with open(js_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-        recompress_js(js_path, content)
-        _LOGGER.info("원본 복원 완료: %s", js_path)
-        return True
-    except Exception as err:
-        _LOGGER.error("복원 중 오류: %s", err)
-        return False
-
-
-async def async_setup(hass: HomeAssistant, config: dict) -> bool:
-
-    async def handle_apply_naver_map(call: ServiceCall) -> None:
-        _LOGGER.info("=== 네이버 지도 교체 서비스 시작 ===")
-
-        version = await hass.async_add_executor_job(get_naver_version)
-        naver_url = build_naver_tile_url(version)
-        _LOGGER.info("적용할 네이버 타일 URL: %s", naver_url)
-
-        frontend_dirs = await hass.async_add_executor_job(find_hass_frontend_dirs)
-        if not frontend_dirs:
-            _LOGGER.error("hass_frontend 경로를 찾을 수 없습니다.")
-            async_create(hass,
-                "❌ 네이버 지도 적용 실패: hass_frontend 경로를 찾을 수 없습니다.",
-                title="Naver Map Change",
-                notification_id="naver_map_change_error"
-            )
-            return
-
-        success_count = 0
-        for frontend_path in frontend_dirs:
-            # CARTO 패턴 먼저 탐색, 없으면 이미 네이버 적용된 파일 탐색
-            js_path = await hass.async_add_executor_job(
-                find_map_js_file, frontend_path, CARTO_TILE_PATTERN
-            )
-            if not js_path:
-                js_path = await hass.async_add_executor_job(
-                    find_map_js_file, frontend_path, NAVER_TILE_PATTERN
-                )
-
-            if not js_path:
-                _LOGGER.warning("지도 JS 파일을 찾을 수 없습니다: %s", frontend_path)
-                continue
-
-            success = await hass.async_add_executor_job(patch_js_file, js_path, naver_url)
-            if success:
-                success_count += 1
-
-        if success_count > 0:
-            msg = (
-                f"✅ 네이버 지도 적용 완료! ({success_count}개 파일)\n"
-                f"버전코드: {version or '자동'}\n\n"
-                f"브라우저 캐시를 초기화(Ctrl+Shift+R)하면 지도가 바뀝니다."
-            )
-            _LOGGER.info("네이버 지도 적용 성공!")
-        else:
-            msg = "❌ 네이버 지도 적용 실패\n로그를 확인하세요."
-
-        async_create(hass, msg, title="Naver Map Change", notification_id="naver_map_change_result")
-
-    async def handle_restore_map(call: ServiceCall) -> None:
-        _LOGGER.info("=== 원본 지도 복원 서비스 시작 ===")
-
-        frontend_dirs = await hass.async_add_executor_job(find_hass_frontend_dirs)
-        if not frontend_dirs:
-            return
-
-        success_count = 0
-        for frontend_path in frontend_dirs:
-            for fname in os.listdir(frontend_path):
-                if fname.endswith(".js.bak"):
-                    js_path = os.path.join(frontend_path, fname.replace(".bak", ""))
-                    success = await hass.async_add_executor_job(restore_js_file, js_path)
-                    if success:
-                        success_count += 1
-
-        msg = (
-            f"✅ 원본 지도 복원 완료! ({success_count}개 파일)\n브라우저 캐시를 초기화(Ctrl+Shift+R)하세요."
-            if success_count > 0 else "⚠️ 백업 파일이 없습니다. 이미 원본 상태입니다."
+        session = async_get_clientsession(self.hass)
+        version = await async_fetch_tilejson_version(
+            session, meta_url, timeout=UPSTREAM_TIMEOUT
         )
-        async_create(hass, msg, title="Naver Map Change", notification_id="naver_map_change_restore")
+        if version is None:
+            _LOGGER.debug("Version refresh for %s failed", self.provider.id)
+            if self.version is None:
+                # Never had a version, so tiles cannot be built at all. The
+                # style endpoint falls back to osm and the user gets told.
+                ir.async_create_issue(
+                    self.hass,
+                    DOMAIN,
+                    ISSUE_VERSION_UNAVAILABLE,
+                    is_fixable=False,
+                    severity=ir.IssueSeverity.WARNING,
+                    translation_key=ISSUE_VERSION_UNAVAILABLE,
+                )
+            return self.version, False
 
-    hass.services.async_register(DOMAIN, "apply", handle_apply_naver_map)
-    hass.services.async_register(DOMAIN, "restore", handle_restore_map)
+        changed = version != self.version
+        self.version = version
+        ir.async_delete_issue(self.hass, DOMAIN, ISSUE_VERSION_UNAVAILABLE)
+        if changed:
+            # No cache invalidation needed: the version is part of the cache key,
+            # so old entries simply stop being addressed (D9, docs/05 section 5).
+            _LOGGER.debug("Version code for %s is now %s", self.provider.id, version)
+        return version, changed
 
-    _LOGGER.info("Naver Map Change 통합구성요소 로드 완료")
+    @callback
+    def request_version_refresh(self) -> None:
+        """Schedule a version refresh, throttled.
+
+        Called from the tile view when upstream answers 400, which is how an
+        expired version code announces itself (docs/05 section 5). Throttled to
+        VERSION_REFRESH_MIN_INTERVAL so a burst of 400s cannot become a burst of
+        upstream calls (design decision D7).
+        """
+        now = time.monotonic()
+        if (
+            self._last_version_refresh is not None
+            and now - self._last_version_refresh
+            < VERSION_REFRESH_MIN_INTERVAL.total_seconds()
+        ):
+            return
+        self._last_version_refresh = now
+        self.hass.async_create_background_task(
+            self.async_refresh_version(), f"{DOMAIN} refresh version"
+        )
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register the services.
+
+    Services are registered here, not in ``async_setup_entry``, so automations
+    can reference and validate them regardless of whether the entry is loaded
+    (docs/02-HA-PLATFORM-2026.md section 4.4). The old ``apply`` / ``restore``
+    services are gone: no file is ever patched, so the concept no longer exists.
+    """
+
+    def _runtime_or_raise() -> NaverMapRuntimeData:
+        for entry in hass.config_entries.async_entries(DOMAIN):
+            runtime: NaverMapRuntimeData | None = getattr(entry, "runtime_data", None)
+            if runtime is not None:
+                return runtime
+        raise ServiceValidationError(
+            translation_domain=DOMAIN, translation_key="entry_not_loaded"
+        )
+
+    async def _async_refresh_version(call: ServiceCall) -> dict[str, Any]:
+        """Refresh the upstream version code now."""
+        runtime = _runtime_or_raise()
+        version, changed = await runtime.async_refresh_version()
+        return {"version": version, "changed": changed}
+
+    async def _async_clear_cache(call: ServiceCall) -> dict[str, Any]:
+        """Empty the tile cache."""
+        runtime = _runtime_or_raise()
+        return {"evicted_bytes": runtime.cache.clear()}
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_REFRESH_VERSION,
+        _async_refresh_version,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_CLEAR_CACHE,
+        _async_clear_cache,
+        supports_response=SupportsResponse.OPTIONAL,
+    )
     return True
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: NaverMapConfigEntry) -> bool:
+    """Set up a config entry."""
+    options: dict[str, Any] = {**entry.data, **entry.options}
+    provider_id = options.get(CONF_PROVIDER, DEFAULT_PROVIDER)
+    if (provider := get_provider(provider_id)) is None:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="unknown_provider",
+            translation_placeholders={"provider": str(provider_id)},
+        )
+
+    cache = TileCache(
+        max_bytes=int(options.get(CONF_CACHE_MAX_BYTES, CACHE_MAX_BYTES)),
+        background=hass.async_create_background_task,
+    )
+    runtime = NaverMapRuntimeData(
+        hass=hass,
+        provider=provider,
+        cache=cache,
+        api_key=options.get(CONF_API_KEY),
+        url_template=options.get(CONF_URL_TEMPLATE),
+        attribution=options.get(CONF_ATTRIBUTION),
+        dark_variant=bool(options.get(CONF_DARK_VARIANT, DEFAULT_DARK_VARIANT)),
+    )
+    entry.runtime_data = runtime
+
+    await _async_register_once(hass)
+
+    # The injected module, added per entry and removed again on unload.
+    # docs/03 section 3.6 assumed add_extra_js_url had no counterpart, but
+    # homeassistant.components.frontend.remove_extra_js_url does exist in
+    # 2026.9.0 (verified in the installed source), and the frontend subscribes
+    # to that list, so removal reaches open browsers without a restart. The
+    # version query busts the browser cache when the integration updates.
+    module_url = f"{FRONTEND_URL_PATH}/{FRONTEND_SCRIPT}?v={INTEGRATION_VERSION}"
+    add_extra_js_url(hass, module_url)
+    entry.async_on_unload(partial(remove_extra_js_url, hass, module_url))
+
+    # First version fetch. A failure is not fatal: the style endpoint falls back
+    # to osm and a repairs issue is raised (docs/03 section 3.2).
+    await runtime.async_refresh_version()
+
+    async def _async_scheduled_refresh(_now: datetime) -> None:
+        await runtime.async_refresh_version()
+
+    entry.async_on_unload(
+        async_track_time_interval(
+            hass,
+            _async_scheduled_refresh,
+            VERSION_REFRESH_INTERVAL,
+            cancel_on_shutdown=True,
+        )
+    )
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+    return True
+
+
+async def _async_register_once(hass: HomeAssistant) -> None:
+    """Register the static path and the views, once per process.
+
+    Neither has a runtime counterpart to unregister with, and registering the
+    views again on an entry reload would collide on the aiohttp routes, so both
+    are guarded by a process-wide flag (design decision D5,
+    docs/03-REDESIGN-SPEC.md section 3.6). The injected module is *not* handled
+    here: it can be removed, so it is per entry.
+    """
+    if hass.data.get(DATA_REGISTERED):
+        return
+    hass.data[DATA_REGISTERED] = True
+
+    # Serving our own folder read-only, through the modern static path API.
+    # The single-path API that was removed in 2025.7 is never used
+    # (docs/02-HA-PLATFORM-2026.md section 4.6).
+    await hass.http.async_register_static_paths(
+        [
+            StaticPathConfig(
+                FRONTEND_URL_PATH,
+                str(Path(__file__).parent / "frontend"),
+                # The keyword is cache_headers in 2026.9.0 (verified against
+                # homeassistant/components/http/__init__.py); the spec's
+                # should_cache does not exist. No cache headers, so an updated
+                # module is picked up even without the ?v= query below.
+                cache_headers=False,
+            )
+        ]
+    )
+    async_register_views(hass)
+
+
+async def _async_update_listener(
+    hass: HomeAssistant, entry: NaverMapConfigEntry
+) -> None:
+    """Reload the entry when its options change."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: NaverMapConfigEntry) -> bool:
+    """Unload a config entry.
+
+    The timer, the update listener, the injected module URL and the cache are
+    released. The views and the static path stay until Home Assistant restarts,
+    because there is no API to remove them (docs/03-REDESIGN-SPEC.md section
+    3.6). This is not hidden: the views answer 503 while no entry is loaded, the
+    style endpoint keeps answering with a valid fallback style, and removing the
+    entry raises a repairs issue asking for a restart.
+    """
+    runtime: NaverMapRuntimeData | None = getattr(entry, "runtime_data", None)
+    if runtime is not None:
+        runtime.cache.clear()
+    return True
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: NaverMapConfigEntry) -> None:
+    """Tell the user a restart is needed to fully undo the injection."""
+    ir.async_create_issue(
+        hass,
+        DOMAIN,
+        ISSUE_RESTART_REQUIRED,
+        is_fixable=False,
+        severity=ir.IssueSeverity.WARNING,
+        translation_key=ISSUE_RESTART_REQUIRED,
+    )

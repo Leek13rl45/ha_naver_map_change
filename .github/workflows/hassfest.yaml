@@ -1,0 +1,23 @@
+name: Validate with hassfest
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # 주 1회 (월요일 04:00 UTC) — 코어가 hassfest 규칙을 바꿨을 때를 감지한다.
+    - cron: "0 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: hassfest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run hassfest
+        uses: home-assistant/actions/hassfest@master
