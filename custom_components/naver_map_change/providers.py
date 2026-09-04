@@ -20,7 +20,12 @@ from typing import TYPE_CHECKING, Any
 
 from .const import (
     MAX_COORDINATE_DIGITS,
+    NAVER_MAP_TYPES,
+    NAVER_MAP_TYPES_QUERY,
+    SCALE_NORMAL,
+    SCALE_RETINA,
     STYLE_VARIANT_QUERY,
+    TILE_SCALE_QUERY,
     TILE_URL_TEMPLATE,
     VARIANT_DARK,
     VARIANT_LIGHT,
@@ -47,6 +52,13 @@ class TileProvider:
     name: str
     url_template: str
     url_template_dark: str | None = None
+    # The @2x (512px) templates, design decision D12. None means "this upstream
+    # has no high-DPI variant we have measured", and a request for scale 2 then
+    # falls back to the 1x template silently rather than failing: a slightly
+    # blurry map beats no map (hard constraint 3). Nothing here is guessed -
+    # only naver has a measured @2x (docs/05-UPSTREAM-FINDINGS.md section 3).
+    url_template_retina: str | None = None
+    url_template_dark_retina: str | None = None
     # Request headers the proxy adds. Naver needs none (finding F2), but the
     # field is kept so a future upstream gate can be answered by editing a
     # provider definition instead of the fetch code (docs/04 section 7).
@@ -73,14 +85,32 @@ PROVIDER_OSM = "osm"
 PROVIDER_VWORLD = "vworld"
 PROVIDER_CUSTOM = "custom"
 
+# The upstream path, assembled once so the 1x and 2x templates cannot drift
+# apart. ``mt`` is the layer selector; its measured per-component byte counts
+# are tabulated on NAVER_MAP_TYPES in const.py (design decision D14).
+_NAVER_BASE = "https://map.pstatic.net/nrb/styles/basic/{version}/{z}/{x}/{y}"
+_NAVER_QUERY = f"?{NAVER_MAP_TYPES_QUERY}={NAVER_MAP_TYPES}"
+
 _NAVER = TileProvider(
     id=PROVIDER_NAVER,
     name="NAVER Map (unofficial)",
-    # Measured: findings section 1 (TileJSON "tiles[0]") and section 2.
-    # Upstream serves .jpg 256px; our own route ends in .png on purpose, see
-    # the note in view.py.
-    url_template="https://map.pstatic.net/nrb/styles/basic/{version}/{z}/{x}/{y}.jpg",
+    # Measured: findings section 1 (TileJSON "tiles[0]") and sections 2-3.
+    #
+    # ``.png``, not ``.jpg`` (design decision D13, reversing the v2.0.1 choice):
+    # a map tile is mostly glyphs and hairlines, which is precisely what JPEG's
+    # block artefacts destroy, and the 1.x implementation used .png for that
+    # reason. Measured 200 image/png, 19,420 bytes, 256x256.
+    #
+    # ``?mt=`` (design decision D14): without it upstream composes its own
+    # default layer set, which measurably is *not* the same tile - bus stops,
+    # subway exits and transit detail are missing from it.
+    url_template=f"{_NAVER_BASE}.png{_NAVER_QUERY}",
     url_template_dark=None,  # F8: no dark style family exists, light is reused.
+    # Measured: 200 image/png, 50,772 bytes, `file` reports 512x512
+    # (docs/05-UPSTREAM-FINDINGS.md section 3).
+    url_template_retina=f"{_NAVER_BASE}@2x.png{_NAVER_QUERY}",
+    # No dark family at all, so there is no dark @2x either (F8).
+    url_template_dark_retina=None,
     headers={},  # F2: measured 200 with zero headers.
     attribution="© NAVER",
     min_zoom=0,  # TileJSON minzoom
@@ -94,6 +124,10 @@ _OSM = TileProvider(
     id=PROVIDER_OSM,
     name="OpenStreetMap",
     url_template="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    # Deliberately None: core 2026.9 deleted its own @2x branch with the comment
+    # "OSM serves no @2x variant" (docs/02-HA-PLATFORM-2026.md section 3.2).
+    # Inventing a template here would produce 404s on every tile.
+    url_template_retina=None,
     # OSMF policy wants an identifying User-Agent; {ha_version} is filled in by
     # resolve_headers() so this module needs no homeassistant import.
     headers={"User-Agent": "HomeAssistant/{ha_version} (+naver_map_change)"},
@@ -111,6 +145,9 @@ _VWORLD = TileProvider(
     # (findings section 7.2). Note the {z}/{y}/{x} order, taken from docs/04
     # section 4.1; it must be confirmed with a valid key.
     url_template="https://api.vworld.kr/req/wmts/1.0.0/{api_key}/Base/{z}/{y}/{x}.png",
+    # None, not a guess: the 1x template itself is still unverified, so a
+    # high-DPI form of it would be a guess on top of a guess (findings 7.2).
+    url_template_retina=None,
     headers={},
     attribution="© 국토교통부 공간정보 오픈플랫폼(VWorld)",
     min_zoom=1,
@@ -127,6 +164,11 @@ _CUSTOM = TileProvider(
     # Placeholder only; the user supplies the real template, which is passed to
     # build_tile_url() as url_template and never format()-ed (D2).
     url_template="{z}/{x}/{y}",
+    # None on purpose: an arbitrary third-party XYZ endpoint cannot be assumed
+    # to understand @2x, and appending it blindly would break every custom
+    # provider that does not. A future extension could ask the user for a
+    # second, optional high-DPI template; it is not invented on their behalf.
+    url_template_retina=None,
     headers={},
     attribution="",
     min_zoom=1,
@@ -161,6 +203,7 @@ def build_tile_url(
     api_key: str | None = None,
     url_template: str | None = None,
     variant: str = VARIANT_LIGHT,
+    scale: int = SCALE_NORMAL,
     z: int,
     x: int,
     y: int,
@@ -174,8 +217,14 @@ def build_tile_url(
     string, which is a needless hazard. Any placeholder still present after
     substitution means a required value was missing, which is an error rather
     than a silently broken URL.
+
+    ``scale`` is the device pixel ratio bucket (design decision D12).
+    ``scale == 2`` asks for the @2x template; a provider without one falls back
+    to its normal template *silently*, because "failure falls back to the
+    default behaviour" is a hard constraint and a 404 here would punch holes in
+    the basemap.
     """
-    template = url_template or _select_template(provider, variant)
+    template = url_template or _select_template(provider, variant, scale)
 
     url = template.replace("{z}", str(z)).replace("{x}", str(x)).replace("{y}", str(y))
     if version:
@@ -193,8 +242,35 @@ def build_tile_url(
     return url
 
 
-def _select_template(provider: TileProvider, variant: str) -> str:
-    """Return the template for this variant, falling back to the light one."""
+def retina_template(
+    provider: TileProvider, variant: str = VARIANT_LIGHT
+) -> str | None:
+    """Return the @2x template for this variant, or None when there is none.
+
+    A dark ``@2x`` template only makes sense for a provider that has its own
+    dark family; when the dark variant reuses the light tiles (naver, F8), the
+    light ``@2x`` template is the correct high-DPI answer for it too.
+    """
+    if variant == VARIANT_DARK and provider.url_template_dark:
+        return provider.url_template_dark_retina
+    return provider.url_template_retina
+
+
+def supports_retina(provider: TileProvider, variant: str = VARIANT_LIGHT) -> bool:
+    """Return whether this provider/variant has a measured @2x template."""
+    return retina_template(provider, variant) is not None
+
+
+def _select_template(
+    provider: TileProvider, variant: str, scale: int = SCALE_NORMAL
+) -> str:
+    """Return the template for this variant and scale.
+
+    Falls back light-ward and 1x-ward rather than raising: an absent dark or
+    absent @2x template is a normal state, not an error.
+    """
+    if scale == SCALE_RETINA and (retina := retina_template(provider, variant)):
+        return retina
     if variant == VARIANT_DARK and provider.url_template_dark:
         return provider.url_template_dark
     return provider.url_template
@@ -217,6 +293,22 @@ def build_proxy_tile_template(
     if variant == VARIANT_DARK and provider.url_template_dark:
         return f"{base}?{STYLE_VARIANT_QUERY}={VARIANT_DARK}"
     return base
+
+
+def _with_scale(
+    tile_url_template: str, provider: TileProvider, variant: str, scale: int
+) -> str:
+    """Append ``?scale=2`` to our proxy template when @2x is really available.
+
+    A query parameter rather than a path segment, for the same reason the dark
+    variant is one: ``withMapTilesToken()`` appends the rotating token onto the
+    existing query string, so ``?variant=dark&scale=2&token=...`` all coexist on
+    one route (docs/02 section 3.3).
+    """
+    if scale != SCALE_RETINA or not supports_retina(provider, variant):
+        return tile_url_template
+    separator = "&" if "?" in tile_url_template else "?"
+    return f"{tile_url_template}{separator}{TILE_SCALE_QUERY}={SCALE_RETINA}"
 
 
 def validate_tile_coords(
@@ -258,16 +350,32 @@ def build_style(
     variant: str = VARIANT_LIGHT,
     tile_url_template: str,
     attribution: str | None = None,
+    scale: int = SCALE_NORMAL,
 ) -> dict[str, Any]:
     """Build a raster-only MapLibre style document (Style Spec v8).
 
     ``glyphs`` and ``sprite`` are deliberately absent: a raster style needs
     neither, and core ``loadStyle()`` passes a missing ``sprite`` straight
     through (docs/02 section 3.2).
+
+    ``scale`` asks the tile route for @2x bytes by appending ``?scale=2`` to the
+    template. It is ignored unless this provider/variant actually has a measured
+    @2x template, so a client on a Retina display still gets a working style
+    from ``osm``, ``vworld`` or ``custom``.
+
+    ★ ``tileSize`` stays ``provider.tile_size`` (256) even at scale 2, and that
+    is the whole point rather than an oversight. In a MapLibre raster source
+    ``tileSize`` is the *logical* size the tile covers, not the pixel size of
+    the image that comes back: declaring a 512px image as ``tileSize: 256`` is
+    exactly how you say "draw this at double pixel density". Setting
+    ``tileSize: 512`` instead shifts the zoom pyramid by one level, so the
+    basemap would render at the wrong scale and the wrong place. The rule is:
+    the @2x switch changes the bytes we fetch and nothing about the geometry.
     """
     source: dict[str, Any] = {
         "type": "raster",
-        "tiles": [tile_url_template],
+        "tiles": [_with_scale(tile_url_template, provider, variant, scale)],
+        # See the ★ note above: never provider.tile_size * scale.
         "tileSize": provider.tile_size,
         "minzoom": provider.min_zoom,
         "maxzoom": min(provider.max_native_zoom, provider.max_zoom),

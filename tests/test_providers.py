@@ -82,10 +82,13 @@ class TestProviderRegistry(unittest.TestCase):
         )
 
     def test_naver_constants_match_measurements(self) -> None:
-        # docs/05-UPSTREAM-FINDINGS.md section 8.
+        # docs/05-UPSTREAM-FINDINGS.md sections 3 and 8.
+        # .png, not .jpg (design decision D13), and with the mt layer selector
+        # (design decision D14). Both measured, neither guessed.
         self.assertEqual(
             NAVER.url_template,
-            "https://map.pstatic.net/nrb/styles/basic/{version}/{z}/{x}/{y}.jpg",
+            "https://map.pstatic.net/nrb/styles/basic/{version}/{z}/{x}/{y}"
+            ".png?mt=bg.ol.ts.ar.lko",
         )
         self.assertEqual(
             NAVER.version_meta_url, "https://map.pstatic.net/nrb/styles/basic.json"
@@ -129,7 +132,8 @@ class TestBuildTileUrl(unittest.TestCase):
             providers.build_tile_url(
                 NAVER, version="1787907321", z=12, x=3492, y=1586
             ),
-            "https://map.pstatic.net/nrb/styles/basic/1787907321/12/3492/1586.jpg",
+            "https://map.pstatic.net/nrb/styles/basic/1787907321/12/3492/1586"
+            ".png?mt=bg.ol.ts.ar.lko",
         )
 
     def test_missing_version_is_an_error(self) -> None:
@@ -226,6 +230,236 @@ class TestBuildTileUrl(unittest.TestCase):
                 NAVER, version="1", variant=const.VARIANT_DARK, z=1, x=1, y=1
             ),
         )
+
+
+class TestNaverFormatAndLayerSelector(unittest.TestCase):
+    """The .png format (D13) and the mt layer selector (D14)."""
+
+    def test_both_templates_are_png_not_jpg(self) -> None:
+        """D13 reverses the v2.0.1 .jpg choice.
+
+        A map tile is mostly glyphs and hairlines, which is what JPEG block
+        artefacts destroy; the 1.x implementation used .png for that reason.
+        """
+        for template in (NAVER.url_template, NAVER.url_template_retina):
+            self.assertIn(".png", template)
+            self.assertNotIn(".jpg", template)
+
+    def test_both_templates_carry_the_measured_layer_selector(self) -> None:
+        """D14: the mt value is the measured one, never assembled from guesses.
+
+        Unknown mt components are answered with HTTP 400 upstream, so the
+        constant is the only safe source for this string.
+        """
+        self.assertEqual(const.NAVER_MAP_TYPES, "bg.ol.ts.ar.lko")
+        self.assertEqual(const.NAVER_MAP_TYPES_QUERY, "mt")
+        expected = f"?{const.NAVER_MAP_TYPES_QUERY}={const.NAVER_MAP_TYPES}"
+        for template in (NAVER.url_template, NAVER.url_template_retina):
+            self.assertTrue(template.endswith(expected), template)
+
+    def test_the_layer_selector_is_not_hardcoded_twice(self) -> None:
+        """The 1x and 2x templates must not be able to drift apart."""
+        self.assertEqual(
+            NAVER.url_template.partition("?")[2],
+            NAVER.url_template_retina.partition("?")[2],
+        )
+
+    def test_the_selector_is_the_only_query_parameter(self) -> None:
+        for template in (NAVER.url_template, NAVER.url_template_retina):
+            self.assertEqual(template.count("?"), 1, template)
+            self.assertEqual(template.count("&"), 0, template)
+
+
+class TestQueryStringTemplates(unittest.TestCase):
+    """A template with a query string must survive substitution intact.
+
+    ``?mt=bg.ol.ts.ar.lko`` (design decision D14) put a query string into the
+    upstream URL for the first time, so the placeholder scan and the coordinate
+    substitution are asserted against it explicitly.
+    """
+
+    def test_coordinates_are_substituted_and_the_query_is_preserved(self) -> None:
+        url = providers.build_tile_url(
+            NAVER, version="1787907321", z=17, x=111925, y=50801
+        )
+        self.assertEqual(
+            url,
+            "https://map.pstatic.net/nrb/styles/basic/1787907321/17/111925/50801"
+            ".png?mt=bg.ol.ts.ar.lko",
+        )
+        # No brace survived, and the query is byte-for-byte what was measured.
+        self.assertNotIn("{", url)
+        self.assertNotIn("}", url)
+        self.assertTrue(url.endswith("?mt=bg.ol.ts.ar.lko"))
+
+    def test_the_at2x_marker_lands_before_the_query_not_after(self) -> None:
+        """``...@2x.png?mt=`` - a query after @2x would 404 upstream."""
+        url = providers.build_tile_url(
+            NAVER, version="1", scale=2, z=1, x=2, y=3
+        )
+        self.assertEqual(
+            url,
+            "https://map.pstatic.net/nrb/styles/basic/1/1/2/3@2x.png"
+            "?mt=bg.ol.ts.ar.lko",
+        )
+        self.assertLess(url.index("@2x"), url.index("?"))
+
+    def test_a_query_string_does_not_trip_the_placeholder_check(self) -> None:
+        """The D2 leftover-placeholder scan must not false-positive on a query."""
+        for template in (NAVER.url_template, NAVER.url_template_retina):
+            # No exception is the assertion.
+            providers.build_tile_url(
+                NAVER, url_template=template, version="1", z=1, x=1, y=1
+            )
+
+    def test_a_custom_template_with_its_own_query_still_works(self) -> None:
+        self.assertEqual(
+            providers.build_tile_url(
+                CUSTOM,
+                url_template="https://example.org/{z}/{x}/{y}.png?a=1&b=2",
+                z=1,
+                x=2,
+                y=3,
+            ),
+            "https://example.org/1/2/3.png?a=1&b=2",
+        )
+
+    def test_a_placeholder_inside_a_query_is_still_an_error(self) -> None:
+        with self.assertRaises(providers.TileUrlError):
+            providers.build_tile_url(
+                CUSTOM,
+                url_template="https://example.org/{z}/{x}/{y}.png?mt={oops}",
+                z=1,
+                x=1,
+                y=1,
+            )
+
+
+class TestRetinaTemplates(unittest.TestCase):
+    """The @2x provider fields (design decision D12)."""
+
+    def test_naver_retina_template_matches_the_measurement(self) -> None:
+        # Measured 512x512, docs/05-UPSTREAM-FINDINGS.md section 3.
+        self.assertEqual(
+            NAVER.url_template_retina,
+            "https://map.pstatic.net/nrb/styles/basic/{version}/{z}/{x}/{y}"
+            "@2x.png?mt=bg.ol.ts.ar.lko",
+        )
+        # No dark family exists at all, so no dark @2x either (F8).
+        self.assertIsNone(NAVER.url_template_dark_retina)
+
+    def test_no_retina_template_is_guessed_for_the_other_providers(self) -> None:
+        """Hard constraint 6: osm/vworld/custom get None, never a guess.
+
+        osm because core 2026.9 states "OSM serves no @2x variant" (docs/02
+        3.2), vworld because its 1x template itself is unverified (docs/05 7.2),
+        custom because a user template cannot be assumed to accept @2x.
+        """
+        for provider in (OSM, VWORLD, CUSTOM):
+            self.assertIsNone(provider.url_template_retina, provider.id)
+            self.assertIsNone(provider.url_template_dark_retina, provider.id)
+            self.assertFalse(providers.supports_retina(provider), provider.id)
+
+    def test_supports_retina(self) -> None:
+        self.assertTrue(providers.supports_retina(NAVER, const.VARIANT_LIGHT))
+        # Naver's dark variant reuses the light tiles, so the light @2x
+        # template is its correct high-DPI answer too.
+        self.assertTrue(providers.supports_retina(NAVER, const.VARIANT_DARK))
+        self.assertFalse(providers.supports_retina(OSM, const.VARIANT_LIGHT))
+
+    def test_a_provider_with_its_own_dark_family_needs_a_dark_retina_template(
+        self,
+    ) -> None:
+        """A dark 1x family without a dark @2x must not borrow the light @2x."""
+        provider = providers.TileProvider(
+            id="two",
+            name="Two",
+            url_template="https://example.org/l/{z}/{x}/{y}.png",
+            url_template_dark="https://example.org/d/{z}/{x}/{y}.png",
+            url_template_retina="https://example.org/l/{z}/{x}/{y}@2x.png",
+        )
+        self.assertTrue(providers.supports_retina(provider, const.VARIANT_LIGHT))
+        self.assertFalse(providers.supports_retina(provider, const.VARIANT_DARK))
+
+
+class TestBuildTileUrlScale(unittest.TestCase):
+    """``scale`` on build_tile_url (design decision D12)."""
+
+    def test_scale_two_uses_the_at2x_template(self) -> None:
+        self.assertEqual(
+            providers.build_tile_url(
+                NAVER, version="1787907321", scale=2, z=12, x=3492, y=1586
+            ),
+            "https://map.pstatic.net/nrb/styles/basic/1787907321/12/3492/1586"
+            "@2x.png?mt=bg.ol.ts.ar.lko",
+        )
+
+    def test_scale_one_is_the_default_and_has_no_at2x(self) -> None:
+        for kwargs in ({}, {"scale": 1}):
+            url = providers.build_tile_url(
+                NAVER, version="1787907321", z=12, x=3492, y=1586, **kwargs
+            )
+            self.assertNotIn("@2x", url)
+
+    def test_scale_two_without_a_retina_template_falls_back_silently(self) -> None:
+        """No exception, no 404 - just the 1x URL (hard constraint 3)."""
+        url = providers.build_tile_url(OSM, scale=2, z=12, x=3492, y=1586)
+        self.assertEqual(url, "https://tile.openstreetmap.org/12/3492/1586.png")
+
+    def test_scale_two_on_a_dark_variant_without_dark_at2x_falls_back_to_dark(
+        self,
+    ) -> None:
+        provider = providers.TileProvider(
+            id="two",
+            name="Two",
+            url_template="https://example.org/l/{z}/{x}/{y}.png",
+            url_template_dark="https://example.org/d/{z}/{x}/{y}.png",
+            url_template_retina="https://example.org/l/{z}/{x}/{y}@2x.png",
+        )
+        url = providers.build_tile_url(
+            provider, variant=const.VARIANT_DARK, scale=2, z=1, x=1, y=1
+        )
+        self.assertEqual(url, "https://example.org/d/1/1/1.png")
+
+    def test_scale_two_uses_the_dark_at2x_template_when_there_is_one(self) -> None:
+        provider = providers.TileProvider(
+            id="two",
+            name="Two",
+            url_template="https://example.org/l/{z}/{x}/{y}.png",
+            url_template_dark="https://example.org/d/{z}/{x}/{y}.png",
+            url_template_retina="https://example.org/l/{z}/{x}/{y}@2x.png",
+            url_template_dark_retina="https://example.org/d/{z}/{x}/{y}@2x.png",
+        )
+        self.assertEqual(
+            providers.build_tile_url(
+                provider, variant=const.VARIANT_DARK, scale=2, z=1, x=1, y=1
+            ),
+            "https://example.org/d/1/1/1@2x.png",
+        )
+
+    def test_an_explicit_template_still_wins(self) -> None:
+        """A caller-supplied template is honoured verbatim at any scale."""
+        self.assertEqual(
+            providers.build_tile_url(
+                CUSTOM,
+                url_template="https://example.org/{z}/{x}/{y}.png",
+                scale=2,
+                z=1,
+                x=2,
+                y=3,
+            ),
+            "https://example.org/1/2/3.png",
+        )
+
+    def test_unexpected_scale_values_behave_as_one(self) -> None:
+        for scale in (0, 1, 3, -2):
+            self.assertNotIn(
+                "@2x",
+                providers.build_tile_url(
+                    NAVER, version="1", scale=scale, z=1, x=1, y=1
+                ),
+                scale,
+            )
 
 
 class TestValidateTileCoords(unittest.TestCase):
@@ -344,6 +578,10 @@ class TestBuildStyle(unittest.TestCase):
                     "api_key",
                     "SECRET_KEY_VALUE",
                     "tile.openstreetmap.org",
+                    # The mt layer selector is an upstream implementation
+                    # detail and must not reach the browser either (D14).
+                    "mt=",
+                    const.NAVER_MAP_TYPES,
                 ):
                     self.assertNotIn(
                         forbidden,
@@ -355,6 +593,123 @@ class TestBuildStyle(unittest.TestCase):
                         tile_url.startswith("/api/map_tiles/naver_map_change/"),
                         tile_url,
                     )
+
+
+class TestBuildStyleScale(unittest.TestCase):
+    """``scale`` on build_style, and the tileSize invariant (D12)."""
+
+    def _style(self, provider: object, **kwargs: object) -> dict:
+        variant = kwargs.pop("variant", const.VARIANT_LIGHT)
+        return providers.build_style(
+            provider,  # type: ignore[arg-type]
+            variant=variant,  # type: ignore[arg-type]
+            tile_url_template=providers.build_proxy_tile_template(
+                provider,  # type: ignore[arg-type]
+                variant=variant,  # type: ignore[arg-type]
+            ),
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    def test_scale_two_appends_the_scale_query(self) -> None:
+        style = self._style(NAVER, scale=2)
+        self.assertEqual(
+            style["sources"]["basemap"]["tiles"],
+            ["/api/map_tiles/naver_map_change/{z}/{x}/{y}.png?scale=2"],
+        )
+
+    def test_scale_one_appends_nothing(self) -> None:
+        for kwargs in ({}, {"scale": 1}):
+            style = self._style(NAVER, **kwargs)
+            self.assertEqual(
+                style["sources"]["basemap"]["tiles"],
+                ["/api/map_tiles/naver_map_change/{z}/{x}/{y}.png"],
+            )
+
+    def test_scale_two_is_ignored_without_a_retina_template(self) -> None:
+        """osm has no @2x, so its style must not ask the route for one."""
+        style = self._style(OSM, scale=2)
+        self.assertEqual(
+            style["sources"]["basemap"]["tiles"],
+            ["/api/map_tiles/naver_map_change/{z}/{x}/{y}.png"],
+        )
+
+    def test_scale_joins_an_existing_variant_query_with_an_ampersand(self) -> None:
+        provider = providers.TileProvider(
+            id="two",
+            name="Two",
+            url_template="https://example.org/l/{z}/{x}/{y}.png",
+            url_template_dark="https://example.org/d/{z}/{x}/{y}.png",
+            url_template_retina="https://example.org/l/{z}/{x}/{y}@2x.png",
+            url_template_dark_retina="https://example.org/d/{z}/{x}/{y}@2x.png",
+        )
+        style = self._style(provider, variant=const.VARIANT_DARK, scale=2)
+        self.assertEqual(
+            style["sources"]["basemap"]["tiles"],
+            ["/api/map_tiles/naver_map_change/{z}/{x}/{y}.png?variant=dark&scale=2"],
+        )
+
+    def test_tile_size_is_always_the_provider_tile_size(self) -> None:
+        """★ The single most important assertion of design decision D12.
+
+        In a MapLibre raster source ``tileSize`` is the logical size the tile
+        covers, not the pixel size of the image that arrives. A 512px image
+        declared as ``tileSize: 256`` is precisely how you request double pixel
+        density. ``tileSize: 512`` would shift the zoom pyramid one level and
+        put the basemap at the wrong scale and position, so the @2x switch must
+        never touch it.
+        """
+        for provider in providers.PROVIDERS.values():
+            for variant in const.VARIANTS:
+                for scale in (1, 2):
+                    style = self._style(provider, variant=variant, scale=scale)
+                    self.assertEqual(
+                        style["sources"]["basemap"]["tileSize"],
+                        provider.tile_size,
+                        f"{provider.id}/{variant}/scale={scale}",
+                    )
+                    self.assertEqual(
+                        style["sources"]["basemap"]["tileSize"],
+                        256,
+                        f"{provider.id}/{variant}/scale={scale}",
+                    )
+
+    def test_zoom_range_is_unchanged_by_scale(self) -> None:
+        """The pyramid is geometry; @2x only changes the bytes."""
+        one = self._style(NAVER, scale=1)["sources"]["basemap"]
+        two = self._style(NAVER, scale=2)["sources"]["basemap"]
+        self.assertEqual((one["minzoom"], one["maxzoom"]), (two["minzoom"], two["maxzoom"]))
+
+    def test_ac6_still_holds_at_scale_two(self) -> None:
+        """AC6 regression guard: no secret, no upstream host, at either scale."""
+        for provider in providers.PROVIDERS.values():
+            for variant in const.VARIANTS:
+                for scale in (1, 2):
+                    style = self._style(
+                        provider, variant=variant, scale=scale, attribution=None
+                    )
+                    serialized = json.dumps(style, ensure_ascii=False)
+                    for forbidden in (
+                        "pstatic.net",
+                        "vworld.kr",
+                        "api_key",
+                        "SECRET_KEY_VALUE",
+                        "tile.openstreetmap.org",
+                        "@2x",
+                        ".jpg",
+                        # The mt layer selector stays server side (D14).
+                        "mt=",
+                        const.NAVER_MAP_TYPES,
+                    ):
+                        self.assertNotIn(
+                            forbidden,
+                            serialized,
+                            f"{provider.id}/{variant}/scale={scale} leaks {forbidden}",
+                        )
+                    for tile_url in style["sources"]["basemap"]["tiles"]:
+                        self.assertTrue(
+                            tile_url.startswith("/api/map_tiles/naver_map_change/"),
+                            tile_url,
+                        )
 
 
 class TestProxyTileTemplate(unittest.TestCase):

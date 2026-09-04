@@ -28,10 +28,28 @@ TILEJSON_BODY: dict[str, Any] = {
     ],
 }
 
+# The layer selector every naver tile request carries (design decision D14).
+# Kept as a literal here rather than imported from const.py, so the test data
+# fails loudly if the constant is changed by accident.
+MAP_TYPES_QUERY = "?mt=bg.ol.ts.ar.lko"
+
 # The proxy never decodes the body, so a short marker is enough.
 TILE_BODY = b"\xff\xd8\xff\xd9tile-bytes"
 
 
+# A distinct body, so a test can tell which of the two resolutions was served.
+TILE_BODY_2X = b"\xff\xd8\xff\xd9tile-bytes-at-2x-which-is-larger"
+
+
 def tile_url(version: str = VERSION, z: int = 12, x: int = 3492, y: int = 1586) -> str:
-    """Return the upstream naver tile URL for these coordinates."""
-    return f"https://map.pstatic.net/nrb/styles/basic/{version}/{z}/{x}/{y}.jpg"
+    """Return the upstream naver 1x tile URL (.png + mt, decisions D13/D14)."""
+    base = f"https://map.pstatic.net/nrb/styles/basic/{version}/{z}/{x}/{y}"
+    return f"{base}.png{MAP_TYPES_QUERY}"
+
+
+def tile_url_2x(
+    version: str = VERSION, z: int = 12, x: int = 3492, y: int = 1586
+) -> str:
+    """Return the upstream naver @2x tile URL (docs/05 section 3, D12-D14)."""
+    base = f"https://map.pstatic.net/nrb/styles/basic/{version}/{z}/{x}/{y}"
+    return f"{base}@2x.png{MAP_TYPES_QUERY}"

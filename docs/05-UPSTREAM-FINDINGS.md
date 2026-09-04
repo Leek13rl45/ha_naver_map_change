@@ -10,7 +10,7 @@
 
 | # | `03`/`04` 문서의 가정 | 실측 결과 | 영향 |
 |---|---|---|---|
-| F1 | 타일 포맷 `.png` | **기본은 `.jpg`.** `.png` 도 응답하지만 동일 타일이 16KB→26KB 로 커진다 | provider 에 upstream 포맷을 명시. 프록시는 upstream `Content-Type` 을 그대로 승계 |
+| F1 | 타일 포맷 `.png` | **기본은 `.jpg`.** `.png` 도 응답하지만 동일 타일이 16KB→26KB 로 커진다 | ~~`.jpg` 를 쓴다(v2.0.1)~~ → **정정(v2.1.0, D13): `.png` 를 쓴다.** 아래 §3 정정 참조. 프록시는 upstream `Content-Type` 을 그대로 승계 |
 | F2 | `Referer` / `User-Agent` 헤더 필수 추정 | **헤더 없이 200.** 브라우저 UA/Referer 를 붙여도 동일하게 200 | `provider.headers` 는 빈 dict 로 시작. 구조는 유지(차단 시 대응 여지) |
 | F3 | CORS 헤더 없음 → 브라우저 직접 호출 불가 | **`access-control-allow-origin: *` 가 있다.** 타일·tilejson 모두 | **프록시의 근거가 바뀐다.** §6 참조 — 설계는 유지되지만 이유가 다르다 |
 | F4 | `max_native_zoom` 19 (코어 값) | tilejson `maxzoom: 21`, z21 에서 실제 타일 확인 | naver provider `max_native_zoom = 21` |
@@ -152,11 +152,98 @@ JPEG image data, ..., 512x512, components 3
   **1차 구현에서는 쓰지 않는다.** 도입하려면 `tileSize: 512` 와 세트로 가야 하고, 32MB 인메모리 캐시에
   담기는 타일 수가 1/3로 줄어든다.
 
-> **결정**: upstream 은 `.jpg` 256px 를 쓴다. 우리 라우트는 `03` §3.4 대로 `.../{z}/{x}/{y}.png` 를
-> 유지한다(코어 URL 형태와의 일관성). **확장자와 실제 바이트가 불일치하지만 무해하다** — MapLibre 와
-> Leaflet 은 모두 `Content-Type` 을 보고 디코딩하며 확장자를 신뢰하지 않는다. 프록시가 upstream
-> `Content-Type: image/jpeg` 를 그대로 승계하므로 브라우저에서 정상 렌더된다.
+> **결정 (v2.0.1 — 아래에서 뒤집힘)**: upstream 은 `.jpg` 256px 를 쓴다. 우리 라우트는 `03` §3.4 대로
+> `.../{z}/{x}/{y}.png` 를 유지한다(코어 URL 형태와의 일관성). **확장자와 실제 바이트가 불일치하지만
+> 무해하다** — MapLibre 와 Leaflet 은 모두 `Content-Type` 을 보고 디코딩하며 확장자를 신뢰하지 않는다.
+> 프록시가 upstream `Content-Type: image/jpeg` 를 그대로 승계하므로 브라우저에서 정상 렌더된다.
 > 이 결정을 코드 주석에 근거와 함께 남긴다.
+
+---
+
+### ⚠️ 정정 (v2.1.0) — 위 §3 의 결정 두 개가 뒤집혔다
+
+이 문서는 근거 기록이므로 위 원문을 지우지 않는다. 아래가 현재 유효한 결정이다.
+
+**정정 계기**: v2.0.1 릴리스 후 실사용자(macOS, Retina `devicePixelRatio` = 2)가
+**"화질이 많이 깨진다"**, **"버스정류장 같은 게 안 뜬다"** 고 보고했다. 원인이 셋이었고 그 중 둘이 위
+§3 에서 내린 결정이다. 1.x 구현(`v1.3.0` 태그의 `custom_components/naver_map_change/__init__.py`,
+`build_naver_tile_url()`)은 세 개를 모두 쓰고 있었다:
+
+```
+https://map.pstatic.net/nrb/styles/basic/{version}/{z}/{x}/{y}@2x.png?mt=bg.ol.ts.ar.lko
+```
+
+#### 정정 1 — `@2x` 를 쓴다 (D12). "1차 구현에서는 쓰지 않는다" 를 뒤집는다
+
+위 §3 은 `@2x` 가 유효함을 실측하고도 **"1차 구현에서는 쓰지 않는다"** 로 미뤄뒀다. 그 유보의 근거
+두 가지가 모두 틀렸다:
+
+1. **"`tileSize: 512` 와 세트로 가야 한다" 는 틀렸다.** MapLibre 래스터 소스의 `tileSize` 는 타일이
+   덮는 **논리적 크기**이며 반환 이미지의 픽셀 크기가 아니다. 512px 이미지를 `tileSize: 256` 으로
+   선언하는 것이 바로 "2배 픽셀 밀도로 선명하게 그려라" 라는 뜻이다. `tileSize: 512` 로 바꾸면 줌
+   피라미드가 한 단계 밀려 **지도 위치·배율이 어긋난다.** 즉 `@2x` 도입에 `tileSize` 변경은 필요하지
+   않고, 오히려 **해서는 안 된다.**
+2. **"캐시 타일 수가 1/3 로 줄어든다" 는 사실이지만 유보의 근거가 못 된다.** 코어 기본 지도는 벡터
+   타일이라 해상도 독립이었으므로 이 열화가 없었다. 래스터로 내려온 우리에게 Retina 화면의 흐림은
+   기능 결손이며, 캐시는 LRU 이므로 워킹셋이 최근 1/3 로 좁아질 뿐이다. 대역폭이 부담인 사용자를
+   위해 옵션(`CONF_RETINA`, 기본 켜짐)으로 끌 수 있게 했다.
+
+#### 정정 2 — `.png` 를 쓴다 (D13). `.jpg` 결정을 뒤집는다
+
+`.jpg` 가 1.62배 작다는 것만 보고 내린 결정이었고, **화질 축을 보지 않은 것이 실수였다.** 지도 타일은
+글자와 얇은 선이 대부분이며 JPEG 의 블록 잡티가 특히 눈에 띄는 종류의 이미지다. 1.x 가 무손실 `.png`
+를 쓴 것이 옳다. 부수 효과로 우리 라우트의 `.png` 확장자와 실제 바이트가 naver 에서는 일치하게 됐지만,
+`custom` provider 는 여전히 임의 포맷을 줄 수 있으므로 **`Content-Type` 승계는 계속 필요하다**
+(D11 주석을 그 방향으로 정정했다).
+
+#### 신규 발견 — `mt` 레이어 선택자 (D14)
+
+v2.0.1 은 `mt` 파라미터를 아예 붙이지 않았다. 이것이 "버스정류장이 안 뜬다" 의 원인이다.
+성분별 실측 (z17, 강남역, `@2x.png`):
+
+| `mt` | 바이트 | 내용 |
+|---|---|---|
+| `bg` | 155 | 배경만, 사실상 빈 타일 |
+| `bg.ol` | 34,041 | + 도로·건물·지하철 노선. **라벨 0** |
+| `bg.lko` | 24,201 | + 한글 라벨 |
+| `bg.ol.lko` | 47,916 | 라벨 O, 버스정류장 X |
+| `bg.ol.ts` | 35,439 | `ts` = 대중교통 |
+| `bg.ol.ar` | 34,041 | `ar` 은 이 타일에서 차이 없음 (`bg.ol` 과 md5 동일) |
+| **`bg.ol.ts.ar.lko`** | 50,772 | **1.x 값. 전부** |
+| 없음 (v2.0.1 동작) | 49,967 | upstream 기본값 — 1.x 값과 **다른 타일이다** |
+| `te`, `tr` 등 미지 성분 | — | **HTTP 400** |
+
+- 성분 의미(`bg`=배경, `ol`=도로/외곽선, `ts`=대중교통, `ar`=면, `lko`=한글 라벨)는 **문서화되지 않은
+  추정**이다. 확인된 사실은 위 바이트 수와 400 응답뿐이다.
+- 미지 성분이 400 을 내므로 이 문자열은 **추측으로 조립하면 안 된다.** `const.py` 의
+  `NAVER_MAP_TYPES` 상수 하나만이 근거 있는 출처다.
+- `mt` 를 **사용자 옵션으로 만들지 않았다.** 사용자가 "전부(1.x 와 동일)"를 선택했으므로 고정값이다.
+- `mt` 값은 upstream 구현 세부사항이므로 **스타일 JSON 을 통해 브라우저로 새어나가지 않아야 한다**
+  (AC6). 브라우저에 노출되는 것은 우리 프록시 라우트뿐이다.
+
+#### 최종 확정 URL (실측 검증)
+
+```console
+1x .png + mt  → 200 image/png 19,420B  256 x 256
+2x .png + mt  → 200 image/png 50,772B  512 x 512
+```
+
+```python
+# providers.py — naver (v2.1.0)
+url_template        = ".../basic/{version}/{z}/{x}/{y}.png?mt=bg.ol.ts.ar.lko"
+url_template_retina = ".../basic/{version}/{z}/{x}/{y}@2x.png?mt=bg.ol.ts.ar.lko"
+```
+
+타일당 바이트가 16,360(구 `.jpg` 1x) → 50,772(신 `.png` 2x) 로 약 3배다. 32MB 캐시에 담기는 타일 수는
+약 650 장으로 줄어든다. **용량 상수는 바꾸지 않았다** — 사용자 옵션이고 eviction 이 LRU 다.
+
+`@2x` 는 naver 만 제공한다. `osm` 은 코어 2026.9 가 "OSM serves no @2x variant" 라고 명시했고
+(`02` §3.2), `vworld` 는 1x 템플릿 자체가 미검증이며(§7.2), `custom` 은 임의의 사용자 템플릿이므로 셋
+모두 retina 템플릿을 **`None` 으로 둔다. 추측값을 넣지 않았다.**
+
+**클라이언트 → 서버 전달**: `devicePixelRatio` 는 서버가 요청만으로 알 수 없는 유일한 사실이므로
+주입 JS 가 스타일 URL 에 `?dpr=<숫자>` 로 전달한다. "스타일 결정은 전부 서버가 한다" 는 기존 원칙의
+유일한 예외이며, 여기서도 JS 는 값을 전달만 하고 판단하지 않는다(임계값 `dpr >= 2` 판정은 서버).
 
 ---
 
@@ -322,8 +409,11 @@ Set-Cookie: JSESSIONID=...; Path=/; HttpOnly
 
 ## 8. 확정 상수 (코드에 넣을 값)
 
+> ⚠️ 아래 naver 블록의 `url_template` 은 v2.0.1 값이다. **v2.1.0 에서 §3 정정으로 바뀌었다** —
+> 현재 유효한 값은 그 아래 블록이다.
+
 ```python
-# providers.py — naver
+# providers.py — naver (v2.0.1, 뒤집힘)
 url_template   = "https://map.pstatic.net/nrb/styles/basic/{version}/{z}/{x}/{y}.jpg"
 version_meta   = "https://map.pstatic.net/nrb/styles/basic.json"   # TileJSON 2.1.0, key "version"
 headers        = {}          # F2: 불필요하나 필드는 유지
@@ -333,6 +423,16 @@ min_zoom       = 0           # tilejson minzoom (코어는 1부터 쓴다)
 max_zoom       = 20          # 코어 MAP_MAX_ZOOM 과 정렬
 max_native_zoom= 21          # tilejson maxzoom (§4)
 url_template_dark = None     # F8: dark 계열 없음 → light 재사용
+```
+
+```python
+# providers.py — naver (v2.1.0, 현재 유효 — §3 정정 참조)
+NAVER_MAP_TYPES = "bg.ol.ts.ar.lko"        # const.py. 성분별 실측표는 §3 정정에
+url_template        = ".../basic/{version}/{z}/{x}/{y}.png?mt=bg.ol.ts.ar.lko"     # D13+D14
+url_template_retina = ".../basic/{version}/{z}/{x}/{y}@2x.png?mt=bg.ol.ts.ar.lko"  # D12+D13+D14
+url_template_dark_retina = None            # F8: dark 계열이 없으므로 dark @2x 도 없다
+tile_size      = 256         # ★ scale 2 에서도 256. 512 로 바꾸면 줌 피라미드가 밀린다
+# 나머지 필드는 위 블록과 동일하다.
 ```
 
 ```python
@@ -358,7 +458,12 @@ attribution  = "© 국토교통부 공간정보 오픈플랫폼(VWorld)"
 - [ ] upstream 400 → 버전 갱신 즉시 트리거(스로틀링 포함), 캐시하지 않는다 (§5)
 - [ ] 캐시 키에 `version` 포함 → 버전 변경이 자동 무효화 (§5, AC12)
 - [ ] 스타일 JSON 의 `attribution` 은 provider 상수에서 나온다. upstream 값(`""`)을 쓰지 않는다 (§1)
-- [ ] `.png` 라우트가 `image/jpeg` 를 서빙하는 이유를 코드 주석에 남긴다 (§3)
+- [ ] ~~`.png` 라우트가 `image/jpeg` 를 서빙하는 이유를 코드 주석에 남긴다 (§3)~~
+      → **정정(D13)**: naver 는 `.png` 를 요청하므로 불일치가 사라졌다. 다만 `custom` provider 는 임의
+      포맷을 줄 수 있으므로 `Content-Type` 승계가 여전히 필요하다는 쪽으로 주석을 정정한다 (§3 정정)
+- [ ] `mt=bg.ol.ts.ar.lko` 를 붙인다. 값은 `const.py` 상수 하나에서만 온다 (§3 정정, D14)
+- [ ] `@2x` 를 dpr 인식으로 붙인다. **`tileSize` 는 256 을 유지한다** (§3 정정, D12)
+- [ ] 캐시 키에 `scale` 포함 → 1x/2x 가 섞이지 않는다 (§3 정정, D12)
 
 ---
 

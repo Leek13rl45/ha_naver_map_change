@@ -39,6 +39,10 @@ async def async_get_config_entry_diagnostics(
         "provider_unverified": runtime.provider.unverified,
         "url_template": runtime.provider.url_template,
         "has_dark_template": runtime.dark_template is not None,
+        # Both facts are needed to explain a "still blurry" report: whether the
+        # user allows @2x, and whether this provider has one at all (D12).
+        "retina_enabled": runtime.retina,
+        "has_retina_template": runtime.provider.url_template_retina is not None,
         "version": runtime.version,
         "version_meta_url": runtime.provider.version_meta_url,
         "can_build_tile_urls": runtime.can_build_tile_urls(),
