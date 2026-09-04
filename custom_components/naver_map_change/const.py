@@ -20,7 +20,7 @@ DOMAIN = "naver_map_change"
 # Kept in sync with manifest.json "version" by hand. The manifest is *not* read
 # at runtime because file reads on the event loop are forbidden (design D6,
 # docs/02-HA-PLATFORM-2026.md section 4.7).
-INTEGRATION_VERSION = "2.0.0"
+INTEGRATION_VERSION = "2.0.1"
 
 # Minimum supported Home Assistant version. Earlier releases have a different
 # map architecture (docs/02-HA-PLATFORM-2026.md section 3).
