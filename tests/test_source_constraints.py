@@ -145,6 +145,17 @@ class TestManifest(unittest.TestCase):
 
         self.assertEqual(self.manifest["version"], const.INTEGRATION_VERSION)
 
+    def test_keys_are_sorted_for_hassfest(self) -> None:
+        """hassfest requires domain, name, then alphabetical order.
+
+        The example in docs/03 section 3.8 is not in that order, and hassfest
+        fails the build over it ("Manifest keys are not sorted correctly"), so
+        this is asserted rather than left to a CI round trip.
+        """
+        keys = list(self.manifest)
+        self.assertEqual(keys[:2], ["domain", "name"])
+        self.assertEqual(keys[2:], sorted(keys[2:]))
+
 
 class TestTranslations(unittest.TestCase):
     """Both languages carry the same keys."""

@@ -166,4 +166,7 @@ actions:
 - 이슈: <https://github.com/Leek13rl45/ha_naver_map_change/issues>
 - 코드오너: [@Leek13rl45](https://github.com/Leek13rl45)
 
-이 저장소에는 별도의 LICENSE 파일이 없습니다. 라이선스 조건은 저장소 소유자에게 문의하십시오.
+이 저장소는 [MIT License](LICENSE) 로 배포됩니다.
+
+지도 타일 자체는 이 라이선스의 대상이 아닙니다. 타일의 저작권과 이용 조건은 각 제공자에게 있으며,
+특히 `naver` 제공자에 대해서는 위 [고지](#고지) 를 반드시 확인하십시오.

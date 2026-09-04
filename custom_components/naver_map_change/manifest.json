@@ -1,14 +1,14 @@
 {
   "domain": "naver_map_change",
   "name": "Naver Map Change",
-  "version": "2.0.0",
-  "integration_type": "service",
+  "codeowners": ["@Leek13rl45"],
   "config_flow": true,
-  "single_config_entry": true,
-  "iot_class": "cloud_polling",
   "dependencies": ["http", "frontend", "map_tiles"],
-  "requirements": [],
   "documentation": "https://github.com/Leek13rl45/ha_naver_map_change",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/Leek13rl45/ha_naver_map_change/issues",
-  "codeowners": ["@Leek13rl45"]
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "2.0.0"
 }
