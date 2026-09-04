@@ -8,6 +8,7 @@ from typing import Any
 
 import voluptuous as vol
 from aiohttp import ClientError
+from awesomeversion import AwesomeVersion
 from homeassistant.config_entries import (
     ConfigFlow,
     ConfigFlowResult,
@@ -63,10 +64,13 @@ def _ha_version_supported() -> bool:
 
     Below 2026.9.0 the map is built differently and this design does not apply
     (docs/02-HA-PLATFORM-2026.md section 3).
+
+    AwesomeVersion is imported at module level on purpose: an import inside a
+    coroutine is one of the blocking calls Home Assistant detects (docs/02
+    section 4.7). The try only guards the comparison, which can raise on an
+    unexpected version string.
     """
     try:
-        from awesomeversion import AwesomeVersion
-
         return AwesomeVersion(HA_VERSION) >= AwesomeVersion(MIN_HA_VERSION)
     except Exception:  # noqa: BLE001 - a parsing quirk must not block setup
         _LOGGER.debug("Could not compare Home Assistant version %s", HA_VERSION)
