@@ -7,10 +7,19 @@ A reduced reimplementation of core ``homeassistant/components/map_tiles/cache.py
   deduplication are unit-testable without a Home Assistant installation
   (design decision D1). The background-refresh hook the core cache gets from
   ``hass.async_create_background_task`` is an injected callable here.
-* The cache key carries the provider id, the upstream version code and the
-  style variant (design decision D9), so a new naver version code separates
-  keys by itself and no explicit invalidation is needed
-  (docs/05-UPSTREAM-FINDINGS.md section 5, AC12).
+* The cache key carries the provider id, the upstream version code, the style
+  variant and the pixel scale (design decisions D9 and D12), so a new naver
+  version code separates keys by itself and no explicit invalidation is needed
+  (docs/05-UPSTREAM-FINDINGS.md section 5, AC12), and a 1x body can never be
+  served to a client that asked for @2x or the other way round.
+
+Sizing note (D12/D13/D14): with the measured ``.png`` + ``mt`` tile, 1x is
+19,420 bytes and 2x is 50,772 bytes, about 3x the 16,360-byte ``.jpg`` tile
+v2.0.1 served. The same ``CACHE_MAX_BYTES`` ceiling therefore holds roughly a
+third as many tiles - about 650 instead of ~2000 - once high-DPI clients are
+being served. The ceiling is intentionally not raised: it is a user option, and
+the eviction below is LRU, so the working set simply becomes the most recent
+third.
 
 Nothing is written to disk: Home Assistant runs on SD cards, and the working
 set is worth a few dozen requests after a restart.
@@ -32,8 +41,9 @@ from .const import CACHE_MAX_BYTES, MAX_CONCURRENT_FETCHES
 # rationale and value as core cache.py.
 _ENTRY_OVERHEAD: Final = 300
 
-# (provider_id, version_or_empty, variant, z, x, y) - design decision D9.
-type CacheKey = tuple[str, str, str, int, int, int]
+# (provider_id, version_or_empty, variant, scale, z, x, y)
+# - design decisions D9 (provider/version/variant) and D12 (scale).
+type CacheKey = tuple[str, str, str, int, int, int, int]
 
 
 @dataclass(frozen=True, slots=True)

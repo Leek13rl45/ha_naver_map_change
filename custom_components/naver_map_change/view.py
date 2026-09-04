@@ -8,13 +8,18 @@ under ``/api/map_tiles/`` lets core's ``withMapTilesToken()`` attach its
 rotating token for us (docs/05-UPSTREAM-FINDINGS.md section 6,
 docs/02-HA-PLATFORM-2026.md section 3.3).
 
-Note on the route extension: our tile route ends in ``.png`` for consistency
-with core's ``/api/map_tiles/raster/{z}/{x}/{y}.png``, but the bytes we serve
-are whatever upstream sent - for naver that is ``image/jpeg`` at 256px
-(docs/05-UPSTREAM-FINDINGS.md sections 2 and 3). This mismatch is harmless
-because MapLibre and Leaflet both decode by ``Content-Type`` and ignore the
-extension, and the proxy passes the upstream ``Content-Type`` through verbatim
-(design decision D11).
+Note on the route extension (design decision D11, amended by D13): our tile
+route ends in ``.png`` for consistency with core's
+``/api/map_tiles/raster/{z}/{x}/{y}.png``, but the bytes we serve are whatever
+upstream sent. For naver that is now ``image/png`` too (D13 moved the upstream
+request from ``.jpg`` to ``.png``, docs/05-UPSTREAM-FINDINGS.md section 3), so
+the extension and the bytes finally agree there - but the passthrough is still
+required, not merely tidy: the ``custom`` provider is an arbitrary
+user-supplied URL that may serve WebP, AVIF or JPEG, and ``vworld`` has never
+been measured with a valid key at all (findings 7.2). The extension is
+therefore never trusted:
+MapLibre and Leaflet both decode by ``Content-Type``, and the proxy passes the
+upstream ``Content-Type`` through verbatim for every provider.
 """
 
 from __future__ import annotations
@@ -34,16 +39,21 @@ from homeassistant.helpers.json import json_bytes
 from .cache import TileAsset, effective_ttl
 from .const import (
     CORE_MAP_TILES_DATA_KEY,
+    DEFAULT_RETINA,
     DOMAIN,
     FALLBACK_PROVIDER,
     FETCH_CHUNK_BYTES,
     ISSUE_MISSING_TOKEN_STORE,
     ISSUE_VERSION_UNAVAILABLE,
     MAX_FETCH_BYTES,
+    SCALE_NORMAL,
+    SCALE_RETINA,
+    STYLE_DPR_QUERY,
     STYLE_MAX_AGE,
     STYLE_URL_PATH,
     STYLE_VARIANT_QUERY,
     TILE_MAX_AGE,
+    TILE_SCALE_QUERY,
     TILE_TTL,
     UPSTREAM_TIMEOUT_S,
     VARIANT_DARK,
@@ -58,6 +68,7 @@ from .providers import (
     build_style,
     build_tile_url,
     resolve_headers,
+    supports_retina,
     validate_tile_coords,
 )
 
@@ -75,6 +86,41 @@ TILE_ROUTE = f"/api/map_tiles/{DOMAIN}/{{z:[0-9]+}}/{{x:[0-9]+}}/{{y:[0-9]+}}.pn
 # One timeout object, shared by every upstream call (core keeps its equivalent
 # in const.py; ours lives here so const.py stays free of aiohttp).
 UPSTREAM_TIMEOUT = ClientTimeout(total=UPSTREAM_TIMEOUT_S)
+
+
+def _parse_scale(raw: str | None) -> int:
+    """Return the requested pixel scale from the tile query, defaulting to 1.
+
+    Deliberately strict and exception-free: only the exact string ``"2"`` means
+    @2x, and every other value - absent, ``"2.0"``, ``"02"``, ``"abc"``, a list
+    of values - is scale 1. There is no ``int()`` here to raise, and no error
+    response to produce: an unparseable scale must degrade to normal tiles, not
+    to a hole in the map (hard constraint 3, design decision D12).
+    """
+    return SCALE_RETINA if raw == str(SCALE_RETINA) else SCALE_NORMAL
+
+
+def _parse_dpr(raw: str | None) -> float:
+    """Return the client's devicePixelRatio from the style query, default 1.0.
+
+    Fractional values (1.5 on many Android devices, 2.625, 3) are kept as sent:
+    the injected module only forwards the number, and the decision of what it
+    means is made here on the server (see frontend/naver-basemap.js). Anything
+    unusable - missing, non-numeric, NaN, infinite, non-positive - is read as
+    1.0 rather than raising, because the style endpoint is not allowed to fail
+    (design decision D10).
+    """
+    if not raw:
+        return 1.0
+    try:
+        dpr = float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+    # NaN compares unequal to itself; inf would pass a naive >= 2 test but is
+    # not a real display.
+    if dpr != dpr or dpr in (float("inf"), float("-inf")) or dpr <= 0:
+        return 1.0
+    return dpr
 
 
 class _NaverMapView(HomeAssistantView):
@@ -167,6 +213,15 @@ class NaverMapTileView(_NaverMapView):
             and runtime.dark_template is not None
             else VARIANT_LIGHT
         )
+        # Both the variant and the scale ride in the query string rather than in
+        # the path, because core's withMapTilesToken() appends its rotating
+        # token onto ``parsed.search`` and leaves the rest of the query intact
+        # (docs/02 section 3.3). A second route per scale would have to be
+        # registered and tokenized separately; a query parameter costs nothing
+        # and follows the pattern ``?variant=dark`` already established.
+        # An unsupported scale is not an error here: build_tile_url() falls back
+        # to the 1x template, so the client gets a tile either way (D12).
+        scale = _parse_scale(request.query.get(TILE_SCALE_QUERY))
 
         # Upstream answers out-of-range coordinates with 200 and a blank tile
         # (docs/05 section 4), so this check is ours to make (D8).
@@ -179,8 +234,9 @@ class NaverMapTileView(_NaverMapView):
                 provider,
                 version=runtime.version,
                 api_key=runtime.api_key,
-                url_template=runtime.template_for(variant),
+                url_template=runtime.template_for(variant, scale),
                 variant=variant,
+                scale=scale,
                 z=zoom,
                 x=column,
                 y=row,
@@ -193,8 +249,11 @@ class NaverMapTileView(_NaverMapView):
             return web.Response(status=HTTPStatus.SERVICE_UNAVAILABLE)
 
         # Version and variant are part of the key, so a new version code
-        # separates keys by itself and needs no invalidation (D9, AC12).
-        key = (provider.id, runtime.version or "", variant, zoom, column, row)
+        # separates keys by itself and needs no invalidation (D9, AC12). The
+        # scale is in the key too (D12): 1x and 2x bodies are different images
+        # of the same tile, and serving one where the other was asked for would
+        # be either a blurry map or a wasted 3.2x of bandwidth.
+        key = (provider.id, runtime.version or "", variant, scale, zoom, column, row)
 
         async def _fetch() -> TileAsset | None:
             return await self._async_fetch(runtime, url)
@@ -300,38 +359,72 @@ class NaverMapStyleView(_NaverMapView):
         if variant not in VARIANTS:
             return web.Response(status=HTTPStatus.NOT_FOUND)
 
-        provider, attribution = self._resolve_style_provider(variant)
+        provider, attribution, retina_enabled = self._resolve_style_provider(variant)
         style = build_style(
             provider,
             variant=variant,
             tile_url_template=build_proxy_tile_template(provider, variant=variant),
             attribution=attribution,
+            scale=self._resolve_scale(request, provider, variant, retina_enabled),
         )
         # This endpoint never fails: a 404, a 500 or an invalid document would
         # leave the user with an empty basemap, and "failure falls back to the
         # default map" is a hard constraint (docs/03 section 0.3, D10).
+        #
+        # No ``Vary`` header despite ?dpr= producing different documents, and
+        # that is correct rather than an omission: ``Vary`` selects on request
+        # *headers*, while the dpr arrives in the URL, so every URL-keyed cache
+        # already stores ?dpr=1 and ?dpr=2 as separate entries. ``private``
+        # keeps the document out of shared caches, and the only remaining
+        # cache - the client's own - belongs to a browser whose
+        # devicePixelRatio does not change underneath it. STYLE_MAX_AGE is
+        # therefore left exactly as it was.
         return web.Response(
             body=json_bytes(style),
             content_type="application/json",
             headers={hdrs.CACHE_CONTROL: f"private, max-age={STYLE_MAX_AGE}"},
         )
 
-    def _resolve_style_provider(self, variant: str) -> tuple[TileProvider, str | None]:
-        """Return the provider whose style to serve, plus its attribution.
+    def _resolve_scale(
+        self,
+        request: web.Request,
+        provider: TileProvider,
+        variant: str,
+        retina_enabled: bool,
+    ) -> int:
+        """Return the pixel scale to build this style document with.
+
+        Three conditions, all required (design decision D12): the client says it
+        has a high-DPI display, this provider/variant has a *measured* @2x
+        template, and the user has not turned the option off. The client fact is
+        the only one the server cannot determine on its own, which is why the
+        injected module forwards ``window.devicePixelRatio`` at all.
+        """
+        if not retina_enabled or not supports_retina(provider, variant):
+            return SCALE_NORMAL
+        dpr = _parse_dpr(request.query.get(STYLE_DPR_QUERY))
+        return SCALE_RETINA if dpr >= SCALE_RETINA else SCALE_NORMAL
+
+    def _resolve_style_provider(
+        self, variant: str
+    ) -> tuple[TileProvider, str | None, bool]:
+        """Return the provider whose style to serve, its attribution and retina.
 
         Falls back to ``osm`` when the configured provider cannot produce tile
         URLs yet - a naver version code that was never fetched, for instance -
-        so the answer is always a usable style (design decision D10).
+        so the answer is always a usable style (design decision D10). The
+        fallback reports retina as enabled because the flag is only ever a veto:
+        ``osm`` has no @2x template, so it changes nothing there.
         """
         fallback = PROVIDERS[FALLBACK_PROVIDER]
 
         runtime = self._runtime_data()
         if runtime is None:
-            return fallback, None
+            return fallback, None, DEFAULT_RETINA
         if not runtime.can_build_tile_urls():
             self._async_create_issue(ISSUE_VERSION_UNAVAILABLE)
-            return fallback, None
-        return runtime.provider, runtime.attribution
+            return fallback, None, DEFAULT_RETINA
+        return runtime.provider, runtime.attribution, runtime.retina
 
 
 def async_register_views(hass: HomeAssistant) -> None:

@@ -50,10 +50,12 @@
           "url_template": "Tile URL template",
           "attribution": "Attribution",
           "dark_variant": "Use dark tiles when the provider has them",
+          "retina": "Sharp tiles on high-resolution displays",
           "cache_max_bytes": "Tile cache size"
         },
         "data_description": {
           "dark_variant": "NAVER has no dark tiles, so the light ones are reused.",
+          "retina": "Fetches the 512px @2x tiles on displays with a device pixel ratio of 2 or more, so the map is no longer blurry there. It roughly triples map data usage, and only NAVER offers these tiles - the other providers ignore this setting.",
           "cache_max_bytes": "In-memory only; nothing is written to disk."
         }
       }

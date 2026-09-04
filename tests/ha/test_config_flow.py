@@ -177,7 +177,31 @@ async def test_unsupported_ha_version_aborts(
     assert result["reason"] == "unsupported_ha_version"
 
 
+async def test_connection_test_accepts_the_png_content_type(
+    hass: HomeAssistant, mock_upstream: Any
+) -> None:
+    """D13 moved naver to .png, so upstream now answers image/png.
+
+    The connection test checks for an ``image/`` prefix rather than a specific
+    media type, so the format change must not have narrowed it. Asserted here
+    because a silent failure would look like "cannot_connect" to the user.
+    """
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_PROVIDER: "naver"}
+    )
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    # And the tile it fetched was the .png + mt one, not the old .jpg.
+    requested = [str(call[1]) for call in mock_upstream.mock_calls]
+    assert tile_url() in requested
+    assert not any(url.endswith(".jpg") for url in requested)
+
+
 def test_tilejson_fixture_matches_the_measurement() -> None:
-    """Guard against the fixture drifting from docs/05 section 1."""
+    """Guard against the fixture drifting from docs/05 sections 1 and 3."""
     assert json.loads(json.dumps(TILEJSON_BODY))["version"] == "1787907321"
-    assert tile_url().endswith("/12/3492/1586.jpg")
+    # .png plus the mt layer selector (design decisions D13 and D14). The
+    # TileJSON's own "format": "jpg" is upstream's default, not what we request.
+    assert tile_url().endswith("/12/3492/1586.png?mt=bg.ol.ts.ar.lko")

@@ -20,7 +20,14 @@ from custom_components.naver_map_change.const import (
     DOMAIN,
 )
 
-from upstream import TILE_BODY, TILEJSON_URL, VERSION, tile_url
+from upstream import (
+    TILE_BODY,
+    TILE_BODY_2X,
+    TILEJSON_URL,
+    VERSION,
+    tile_url,
+    tile_url_2x,
+)
 
 TILE_PATH = "/api/map_tiles/naver_map_change/12/3492/1586.png"
 STYLE_PATH = "/api/map_tiles/naver_map_change/style/light.json"
@@ -60,8 +67,9 @@ async def test_ac5_tile_with_a_valid_token_is_served(
     response = await client.get(f"{TILE_PATH}?token={_token(hass)}")
     assert response.status == HTTPStatus.OK
     assert await response.read() == TILE_BODY
-    # The route says .png, the bytes are JPEG - see design decision D11.
-    assert response.headers["Content-Type"] == "image/jpeg"
+    # Upstream's Content-Type is passed through verbatim, whatever it is
+    # (design decision D11, amended by D13: naver now serves image/png).
+    assert response.headers["Content-Type"] == "image/png"
     assert response.headers["Cache-Control"] == "private, max-age=604800"
     # Only whitelisted headers are passed through (design decision D7).
     assert "Set-Cookie" not in response.headers
@@ -245,7 +253,18 @@ async def test_ac6_style_document_has_no_secret_and_needs_no_token(
     assert "glyphs" not in style
 
     body = await response.text()
-    for forbidden in ("pstatic.net", "vworld.kr", "api_key", VERSION):
+    for forbidden in (
+        "pstatic.net",
+        "vworld.kr",
+        "api_key",
+        VERSION,
+        # Upstream implementation details, all server side only: the format
+        # (D13), the layer selector (D14) and the @2x marker (D12).
+        ".jpg",
+        "mt=",
+        "bg.ol.ts.ar.lko",
+        "@2x",
+    ):
         assert forbidden not in body
 
 
@@ -300,6 +319,228 @@ async def test_style_without_a_loaded_entry_is_still_a_valid_style(
     assert style["layers"][0]["type"] == "raster"
 
 
+TILES = "sources", "basemap", "tiles"
+
+
+def _tiles(style: dict) -> list[str]:
+    """Return the tile templates of a style document."""
+    return style["sources"]["basemap"]["tiles"]
+
+
+async def test_style_at_dpr_two_asks_for_scale_two_and_keeps_tile_size_256(
+    hass: HomeAssistant, client: Any
+) -> None:
+    """★ Design decision D12, the whole point of the change.
+
+    ``tileSize`` stays 256 while the tile URL carries ``scale=2``: in MapLibre
+    that pair means "a 512px image covering a 256px logical tile", which is how
+    a raster basemap renders sharply on a Retina display. Bumping tileSize to
+    512 instead would shift the zoom pyramid and misplace the map.
+    """
+    response = await client.get(f"{STYLE_PATH}?dpr=2")
+    assert response.status == HTTPStatus.OK
+    style = await response.json()
+    assert _tiles(style) == [
+        "/api/map_tiles/naver_map_change/{z}/{x}/{y}.png?scale=2"
+    ]
+    assert style["sources"]["basemap"]["tileSize"] == 256
+
+
+async def test_style_at_dpr_one_asks_for_no_scale(
+    hass: HomeAssistant, client: Any
+) -> None:
+    """A 1x display gets the cheap tiles and an unchanged template."""
+    response = await client.get(f"{STYLE_PATH}?dpr=1")
+    assert response.status == HTTPStatus.OK
+    assert _tiles(await response.json()) == [
+        "/api/map_tiles/naver_map_change/{z}/{x}/{y}.png"
+    ]
+
+
+async def test_style_without_a_dpr_parameter_asks_for_no_scale(
+    hass: HomeAssistant, client: Any
+) -> None:
+    """An older cached copy of the injected module sends no dpr at all."""
+    assert _tiles(await (await client.get(STYLE_PATH)).json()) == [
+        "/api/map_tiles/naver_map_change/{z}/{x}/{y}.png"
+    ]
+
+
+async def test_unparseable_dpr_is_treated_as_one_and_never_fails(
+    hass: HomeAssistant, client: Any
+) -> None:
+    """The style endpoint is not allowed to fail (design decision D10)."""
+    for raw in ("abc", "", "nan", "inf", "-2", "0", "2,0", "2px", "[]"):
+        response = await client.get(f"{STYLE_PATH}?dpr={raw}")
+        assert response.status == HTTPStatus.OK, raw
+        assert _tiles(await response.json()) == [
+            "/api/map_tiles/naver_map_change/{z}/{x}/{y}.png"
+        ], raw
+
+
+async def test_fractional_dpr_is_decided_on_the_server(
+    hass: HomeAssistant, client: Any
+) -> None:
+    """The module forwards 1.5/2.625 verbatim; the threshold lives here."""
+    below = await client.get(f"{STYLE_PATH}?dpr=1.5")
+    assert _tiles(await below.json()) == [
+        "/api/map_tiles/naver_map_change/{z}/{x}/{y}.png"
+    ]
+    above = await client.get(f"{STYLE_PATH}?dpr=2.625")
+    assert _tiles(await above.json()) == [
+        "/api/map_tiles/naver_map_change/{z}/{x}/{y}.png?scale=2"
+    ]
+
+
+async def test_style_at_dpr_two_with_retina_disabled_asks_for_no_scale(
+    hass: HomeAssistant,
+    hass_client_no_auth: Any,
+    mock_upstream: Any,
+    config_entry: MockConfigEntry,
+) -> None:
+    """The option is a veto: off means 1x tiles even on a Retina display."""
+    from custom_components.naver_map_change.const import CONF_RETINA
+
+    config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(config_entry, options={CONF_RETINA: False})
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    client = await hass_client_no_auth()
+
+    response = await client.get(f"{STYLE_PATH}?dpr=2")
+    assert response.status == HTTPStatus.OK
+    style = await response.json()
+    assert _tiles(style) == ["/api/map_tiles/naver_map_change/{z}/{x}/{y}.png"]
+    assert style["sources"]["basemap"]["tileSize"] == 256
+
+
+async def test_style_at_dpr_two_on_osm_asks_for_no_scale(
+    hass: HomeAssistant,
+    hass_client_no_auth: Any,
+    aioclient_mock: Any,
+    osm_config_entry: MockConfigEntry,
+) -> None:
+    """osm has no measured @2x variant, so nothing is requested (docs/02 3.2)."""
+    aioclient_mock.get(
+        "https://tile.openstreetmap.org/12/3492/1586.png",
+        content=TILE_BODY,
+        headers={"Content-Type": "image/png"},
+    )
+    osm_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(osm_config_entry.entry_id)
+    await hass.async_block_till_done()
+    client = await hass_client_no_auth()
+
+    response = await client.get(f"{STYLE_PATH}?dpr=2")
+    assert response.status == HTTPStatus.OK
+    style = await response.json()
+    assert _tiles(style) == ["/api/map_tiles/naver_map_change/{z}/{x}/{y}.png"]
+    assert style["sources"]["basemap"]["attribution"] == "© OpenStreetMap contributors"
+
+
+async def test_ac6_style_at_dpr_two_still_leaks_nothing(
+    hass: HomeAssistant, client: Any
+) -> None:
+    """AC6 regression guard: the @2x switch must not leak upstream detail."""
+    response = await client.get(f"{STYLE_PATH}?dpr=2")
+    body = await response.text()
+    for forbidden in (
+        "pstatic.net",
+        "vworld.kr",
+        "api_key",
+        VERSION,
+        "@2x",
+        ".jpg",
+        "mt=",
+        "bg.ol.ts.ar.lko",
+    ):
+        assert forbidden not in body
+
+
+async def test_tile_route_at_scale_two_fetches_the_at2x_upstream_url(
+    hass: HomeAssistant, client: Any, mock_upstream: Any
+) -> None:
+    """``?scale=2`` reaches upstream as the @2x path (docs/05 section 3)."""
+    response = await client.get(f"{TILE_PATH}?scale=2&token={_token(hass)}")
+    assert response.status == HTTPStatus.OK
+    assert await response.read() == TILE_BODY_2X
+    assert response.headers["Content-Type"] == "image/png"
+    requested = [str(call[1]) for call in mock_upstream.mock_calls]
+    assert tile_url_2x() in requested
+    assert tile_url() not in requested
+
+
+async def test_scale_one_and_scale_two_are_cached_separately(
+    hass: HomeAssistant, client: Any, config_entry: MockConfigEntry
+) -> None:
+    """The cache key carries the scale (D12), so the bodies cannot mix."""
+    token = _token(hass)
+    one = await client.get(f"{TILE_PATH}?token={token}")
+    two = await client.get(f"{TILE_PATH}?scale=2&token={token}")
+    assert await one.read() == TILE_BODY
+    assert await two.read() == TILE_BODY_2X
+    assert len(config_entry.runtime_data.cache) == 2
+
+    # And a repeat of each is served from its own entry, not the other's.
+    assert await (await client.get(f"{TILE_PATH}?token={token}")).read() == TILE_BODY
+    assert (
+        await (await client.get(f"{TILE_PATH}?scale=2&token={token}")).read()
+        == TILE_BODY_2X
+    )
+
+
+async def test_only_the_literal_string_two_means_retina(
+    hass: HomeAssistant, client: Any, mock_upstream: Any
+) -> None:
+    """Strict parsing, and no exception path: everything else is scale 1."""
+    token = _token(hass)
+    for raw in ("1", "2.0", "02", " 2", "abc", "", "3", "-2", "true"):
+        response = await client.get(f"{TILE_PATH}?scale={raw}&token={token}")
+        assert response.status == HTTPStatus.OK, raw
+        assert await response.read() == TILE_BODY, raw
+
+
+async def test_scale_two_on_a_provider_without_at2x_falls_back_not_404(
+    hass: HomeAssistant,
+    hass_client_no_auth: Any,
+    aioclient_mock: Any,
+    osm_config_entry: MockConfigEntry,
+) -> None:
+    """Hard constraint 3: an unsupported scale degrades, it does not fail."""
+    aioclient_mock.get(
+        "https://tile.openstreetmap.org/12/3492/1586.png",
+        content=TILE_BODY,
+        headers={"Content-Type": "image/png"},
+    )
+    osm_config_entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(osm_config_entry.entry_id)
+    await hass.async_block_till_done()
+    client = await hass_client_no_auth()
+
+    response = await client.get(f"{TILE_PATH}?scale=2&token={_token(hass)}")
+    assert response.status == HTTPStatus.OK
+    assert await response.read() == TILE_BODY
+    requested = [str(call[1]) for call in aioclient_mock.mock_calls]
+    assert "https://tile.openstreetmap.org/12/3492/1586.png" in requested
+    assert not any("@2x" in url for url in requested)
+
+
+async def test_scale_and_variant_and_token_coexist_on_one_route(
+    hass: HomeAssistant, client: Any
+) -> None:
+    """Why a query parameter and not a path segment (docs/02 section 3.3).
+
+    withMapTilesToken() appends its token onto the existing query string, so
+    ``?variant=dark&scale=2&token=...`` all have to survive together.
+    """
+    response = await client.get(
+        f"{TILE_PATH}?variant=dark&scale=2&token={_token(hass)}"
+    )
+    assert response.status == HTTPStatus.OK
+    # Naver has no dark family, so dark reuses the light @2x tiles (F8).
+    assert await response.read() == TILE_BODY_2X
+
+
 async def test_injected_module_is_served(hass: HomeAssistant, client: Any) -> None:
     """The static path serves the frontend module (docs/02 4.8)."""
     response = await client.get("/naver_map_change_frontend/naver-basemap.js")
@@ -307,3 +548,7 @@ async def test_injected_module_is_served(hass: HomeAssistant, client: Any) -> No
     body = await response.text()
     assert "__naverMapChangePatched" in body
     assert "/api/map_tiles/naver_map_change/style/light.json" in body
+    # Design decision D12: the module forwards devicePixelRatio, which is the
+    # one client-side fact the server cannot know for itself.
+    assert "devicePixelRatio" in body
+    assert "?dpr=" in body

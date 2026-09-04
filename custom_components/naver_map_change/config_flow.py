@@ -26,9 +26,11 @@ from .const import (
     CONF_CACHE_MAX_BYTES,
     CONF_DARK_VARIANT,
     CONF_PROVIDER,
+    CONF_RETINA,
     CONF_URL_TEMPLATE,
     DEFAULT_DARK_VARIANT,
     DEFAULT_PROVIDER,
+    DEFAULT_RETINA,
     DOMAIN,
     MIN_HA_VERSION,
     TEST_TILE_X,
@@ -295,6 +297,14 @@ class NaverMapChangeOptionsFlow(OptionsFlow):
                 vol.Optional(
                     CONF_DARK_VARIANT,
                     default=current.get(CONF_DARK_VARIANT, DEFAULT_DARK_VARIANT),
+                ): selector.BooleanSelector(),
+                # On by default (design decision D12). Offered as a switch
+                # because @2x costs roughly 3.2x the bytes, which matters on a
+                # metered connection even though it is what fixes the blur on a
+                # Retina display.
+                vol.Optional(
+                    CONF_RETINA,
+                    default=current.get(CONF_RETINA, DEFAULT_RETINA),
                 ): selector.BooleanSelector(),
                 vol.Optional(
                     CONF_CACHE_MAX_BYTES,

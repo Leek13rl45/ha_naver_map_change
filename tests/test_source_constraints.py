@@ -30,7 +30,12 @@ FORBIDDEN_SUBSTRINGS = (
     "brotli",
     ".js.bak",
     "urllib",
-    "RETINA",
+    # The old implementation's identifier, verbatim from docs/03 section 7's
+    # "do not port" list. This entry used to read just "RETINA", which was
+    # broader than the documented ban and collided with the legitimate
+    # CONF_RETINA option added in 2.1.0 (design decision D12). The thing being
+    # guarded against is the minified-bundle pattern list, not the word.
+    "RETINA_PATTERNS",
     "cartocdn",
     "find_hass_frontend_dirs",
     "find_map_js_file",

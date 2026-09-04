@@ -45,16 +45,20 @@ from .const import (
     CONF_CACHE_MAX_BYTES,
     CONF_DARK_VARIANT,
     CONF_PROVIDER,
+    CONF_RETINA,
     CONF_URL_TEMPLATE,
     DATA_REGISTERED,
     DEFAULT_DARK_VARIANT,
     DEFAULT_PROVIDER,
+    DEFAULT_RETINA,
     DOMAIN,
     FRONTEND_SCRIPT,
     FRONTEND_URL_PATH,
     INTEGRATION_VERSION,
     ISSUE_RESTART_REQUIRED,
     ISSUE_VERSION_UNAVAILABLE,
+    SCALE_NORMAL,
+    SCALE_RETINA,
     SERVICE_CLEAR_CACHE,
     SERVICE_REFRESH_VERSION,
     VARIANT_DARK,
@@ -68,6 +72,7 @@ from .providers import (
     async_fetch_tilejson_version,
     build_tile_url,
     get_provider,
+    retina_template,
 )
 from .view import UPSTREAM_TIMEOUT, async_register_views
 
@@ -95,6 +100,9 @@ class NaverMapRuntimeData:
     url_template: str | None = None
     attribution: str | None = None
     dark_variant: bool = DEFAULT_DARK_VARIANT
+    # User veto on @2x tiles (design decision D12). On by default; turning it
+    # off means a Retina client keeps getting 1x tiles and a third of the bytes.
+    retina: bool = DEFAULT_RETINA
     version: str | None = None
     ha_version: str = HA_VERSION
     _last_version_refresh: float | None = field(default=None, init=False, repr=False)
@@ -110,12 +118,24 @@ class NaverMapRuntimeData:
             return None
         return self.provider.url_template_dark
 
-    def template_for(self, variant: str) -> str | None:
-        """Return an explicit URL template override for this variant.
+    def template_for(self, variant: str, scale: int = SCALE_NORMAL) -> str | None:
+        """Return an explicit URL template override for this variant and scale.
 
-        None means "use the provider's own template"; a string is either the
-        user's ``custom`` template or the provider's dark template.
+        None means "use the provider's own template"; a string is the
+        provider's @2x template, the provider's dark template, or the user's
+        ``custom`` template, in that order of precedence.
+
+        The @2x template wins over the 1x dark override because
+        ``retina_template()`` is already variant-aware: for a provider with its
+        own dark family it returns the dark @2x template, and for one where dark
+        reuses the light tiles it returns the light @2x one, which is the right
+        answer in both cases. ``custom`` has no @2x template by definition, so a
+        user template is never silently replaced.
         """
+        if scale == SCALE_RETINA and (
+            retina := retina_template(self.provider, variant)
+        ) is not None:
+            return retina
         if variant == VARIANT_DARK and self.dark_template:
             return self.dark_template
         if self.provider.id == PROVIDER_CUSTOM:
@@ -268,6 +288,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: NaverMapConfigEntry) -> 
         url_template=options.get(CONF_URL_TEMPLATE),
         attribution=options.get(CONF_ATTRIBUTION),
         dark_variant=bool(options.get(CONF_DARK_VARIANT, DEFAULT_DARK_VARIANT)),
+        retina=bool(options.get(CONF_RETINA, DEFAULT_RETINA)),
     )
     entry.runtime_data = runtime
 

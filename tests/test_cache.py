@@ -41,12 +41,13 @@ def key(
     provider: str = "naver",
     version: str = "1787907321",
     variant: str = "light",
+    scale: int = 1,
     z: int = 12,
     x: int = 3492,
     y: int = 1586,
 ) -> tuple:
-    """Build a cache key (design decision D9)."""
-    return (provider, version, variant, z, x, y)
+    """Build a cache key (design decisions D9 and D12)."""
+    return (provider, version, variant, scale, z, x, y)
 
 
 class TestStoreAndEvict(unittest.TestCase):
@@ -306,6 +307,37 @@ class TestVersionInCacheKey(unittest.TestCase):
         self.assertEqual(cache.peek(key(provider="naver")).body, b"naver")
         self.assertEqual(cache.peek(key(provider="osm", version="")).body, b"osm")
         self.assertEqual(cache.peek(key(variant="dark")).body, b"dark")
+
+    def test_scale_separates_keys(self) -> None:
+        """Design decision D12: a 1x body and a 2x body never mix.
+
+        They are different images of the same tile, so serving one where the
+        other was asked for is either a blurry map or 3.2x of wasted bandwidth.
+        """
+        cache = TileCache(max_bytes=1024 * 1024)
+        cache.store(key(scale=1), asset(b"tile-1x"))
+        cache.store(key(scale=2), asset(b"tile-2x"))
+        self.assertEqual(len(cache), 2)
+        self.assertEqual(cache.peek(key(scale=1)).body, b"tile-1x")
+        self.assertEqual(cache.peek(key(scale=2)).body, b"tile-2x")
+
+    def test_a_2x_request_does_not_hit_the_1x_entry(self) -> None:
+        fetched: list[int] = []
+
+        async def fetch_2x():
+            fetched.append(2)
+            return asset(b"tile-2x")
+
+        async def scenario() -> None:
+            cache = TileCache(max_bytes=1024 * 1024)
+            cache.store(key(scale=1), asset(b"tile-1x"))
+            served = await cache.async_get(key(scale=2), const.TILE_TTL, fetch_2x)
+            self.assertEqual(served.body, b"tile-2x")
+            # The 1x entry is untouched, so a 1x client still gets its own body.
+            self.assertEqual(cache.peek(key(scale=1)).body, b"tile-1x")
+
+        asyncio.run(scenario())
+        self.assertEqual(fetched, [2])
 
 
 class TestTtlParsing(unittest.TestCase):

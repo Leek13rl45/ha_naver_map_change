@@ -28,7 +28,14 @@ from custom_components.naver_map_change.const import (  # noqa: E402
     CONF_PROVIDER,
     DOMAIN,
 )
-from upstream import TILE_BODY, TILEJSON_BODY, TILEJSON_URL, tile_url  # noqa: E402
+from upstream import (  # noqa: E402
+    TILE_BODY,
+    TILE_BODY_2X,
+    TILEJSON_BODY,
+    TILEJSON_URL,
+    tile_url,
+    tile_url_2x,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -50,7 +57,14 @@ def mock_upstream(aioclient_mock: Any) -> Any:
     aioclient_mock.get(
         tile_url(),
         content=TILE_BODY,
-        headers={"Content-Type": "image/jpeg", "Cache-Control": "max-age=31536000"},
+        headers={"Content-Type": "image/png", "Cache-Control": "max-age=31536000"},
+    )
+    # The measured @2x variant (docs/05 section 3, design decision D12), with a
+    # different body so a test can prove which resolution was fetched.
+    aioclient_mock.get(
+        tile_url_2x(),
+        content=TILE_BODY_2X,
+        headers={"Content-Type": "image/png", "Cache-Control": "max-age=31536000"},
     )
     return aioclient_mock
 
@@ -63,4 +77,15 @@ def config_entry() -> MockConfigEntry:
         title="NAVER Map (unofficial)",
         data={CONF_PROVIDER: "naver"},
         entry_id="naver_map_change_test",
+    )
+
+
+@pytest.fixture
+def osm_config_entry() -> MockConfigEntry:
+    """Return an osm config entry - the provider with no @2x variant."""
+    return MockConfigEntry(
+        domain=DOMAIN,
+        title="OpenStreetMap",
+        data={CONF_PROVIDER: "osm"},
+        entry_id="naver_map_change_osm_test",
     )
