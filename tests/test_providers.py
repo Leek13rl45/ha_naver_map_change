@@ -99,7 +99,19 @@ class TestProviderRegistry(unittest.TestCase):
         self.assertEqual(NAVER.min_zoom, 0)
         self.assertEqual(NAVER.max_zoom, 20)
         self.assertEqual(NAVER.max_native_zoom, 21)
-        self.assertIsNone(NAVER.url_template_dark)
+        # Design decision D15, correcting finding F8: the dark family exists
+        # and is the "dbasic" style. The original survey concluded "no dark
+        # family" only because it never tried the "d" prefix.
+        self.assertEqual(
+            NAVER.url_template_dark,
+            "https://map.pstatic.net/nrb/styles/dbasic/{version}/{z}/{x}/{y}"
+            ".png?mt=bg.ol.ts.ar.lko",
+        )
+        # One refresher covers both: dbasic.json publishes the same version
+        # code as basic.json, so no second version_meta_url is needed.
+        self.assertEqual(
+            NAVER.version_meta_url, "https://map.pstatic.net/nrb/styles/basic.json"
+        )
 
     def test_osm_constants_match_measurements(self) -> None:
         self.assertEqual(
@@ -223,13 +235,38 @@ class TestBuildTileUrl(unittest.TestCase):
         )
 
     def test_dark_variant_falls_back_to_light_when_absent(self) -> None:
-        # Naver has no dark family (docs/05 F8).
-        self.assertIn(
-            "/basic/",
-            providers.build_tile_url(
-                NAVER, version="1", variant=const.VARIANT_DARK, z=1, x=1, y=1
-            ),
+        """A provider with no dark family reuses its light template.
+
+        Naver used to be the example here; design decision D15 corrected
+        finding F8 and gave it a real dark family, so the fallback is now shown
+        with a provider that genuinely has none (osm).
+        """
+        self.assertEqual(
+            providers.build_tile_url(OSM, variant=const.VARIANT_DARK, z=1, x=1, y=1),
+            providers.build_tile_url(OSM, variant=const.VARIANT_LIGHT, z=1, x=1, y=1),
         )
+
+    def test_naver_dark_variant_uses_the_dbasic_family(self) -> None:
+        """D15: the dark request goes to dbasic, not basic."""
+        url = providers.build_tile_url(
+            NAVER, version="1788514292", variant=const.VARIANT_DARK, z=17, x=1, y=2
+        )
+        self.assertEqual(
+            url,
+            "https://map.pstatic.net/nrb/styles/dbasic/1788514292/17/1/2"
+            ".png?mt=bg.ol.ts.ar.lko",
+        )
+        self.assertNotIn("/basic/", url)
+
+    def test_naver_light_and_dark_differ_only_in_the_style_name(self) -> None:
+        """The four templates are assembled from one shape (D15)."""
+        light = providers.build_tile_url(
+            NAVER, version="1", variant=const.VARIANT_LIGHT, z=1, x=2, y=3
+        )
+        dark = providers.build_tile_url(
+            NAVER, version="1", variant=const.VARIANT_DARK, z=1, x=2, y=3
+        )
+        self.assertEqual(light.replace("/basic/", "/dbasic/"), dark)
 
 
 class TestNaverFormatAndLayerSelector(unittest.TestCase):
@@ -345,8 +382,13 @@ class TestRetinaTemplates(unittest.TestCase):
             "https://map.pstatic.net/nrb/styles/basic/{version}/{z}/{x}/{y}"
             "@2x.png?mt=bg.ol.ts.ar.lko",
         )
-        # No dark family exists at all, so no dark @2x either (F8).
-        self.assertIsNone(NAVER.url_template_dark_retina)
+        # D15 corrected F8: the dark family exists, so it has an @2x too.
+        # Measured 200 image/png, 53,195 bytes.
+        self.assertEqual(
+            NAVER.url_template_dark_retina,
+            "https://map.pstatic.net/nrb/styles/dbasic/{version}/{z}/{x}/{y}"
+            "@2x.png?mt=bg.ol.ts.ar.lko",
+        )
 
     def test_no_retina_template_is_guessed_for_the_other_providers(self) -> None:
         """Hard constraint 6: osm/vworld/custom get None, never a guess.
@@ -362,9 +404,17 @@ class TestRetinaTemplates(unittest.TestCase):
 
     def test_supports_retina(self) -> None:
         self.assertTrue(providers.supports_retina(NAVER, const.VARIANT_LIGHT))
-        # Naver's dark variant reuses the light tiles, so the light @2x
-        # template is its correct high-DPI answer too.
+        # Since D15 naver has its own dark family, so the dark variant resolves
+        # to the *dark* @2x template rather than borrowing the light one.
         self.assertTrue(providers.supports_retina(NAVER, const.VARIANT_DARK))
+        self.assertEqual(
+            providers.retina_template(NAVER, const.VARIANT_DARK),
+            NAVER.url_template_dark_retina,
+        )
+        self.assertNotEqual(
+            providers.retina_template(NAVER, const.VARIANT_DARK),
+            providers.retina_template(NAVER, const.VARIANT_LIGHT),
+        )
         self.assertFalse(providers.supports_retina(OSM, const.VARIANT_LIGHT))
 
     def test_a_provider_with_its_own_dark_family_needs_a_dark_retina_template(
@@ -722,9 +772,21 @@ class TestProxyTileTemplate(unittest.TestCase):
         )
 
     def test_dark_without_dark_tiles_is_identical(self) -> None:
+        """osm has no dark family, so its dark template needs no query."""
+        self.assertEqual(
+            providers.build_proxy_tile_template(OSM, variant=const.VARIANT_DARK),
+            providers.build_proxy_tile_template(OSM, variant=const.VARIANT_LIGHT),
+        )
+
+    def test_naver_dark_now_carries_the_variant_query(self) -> None:
+        """D15: naver has a real dark family, so the route must be told."""
         self.assertEqual(
             providers.build_proxy_tile_template(NAVER, variant=const.VARIANT_DARK),
+            "/api/map_tiles/naver_map_change/{z}/{x}/{y}.png?variant=dark",
+        )
+        self.assertEqual(
             providers.build_proxy_tile_template(NAVER, variant=const.VARIANT_LIGHT),
+            "/api/map_tiles/naver_map_change/{z}/{x}/{y}.png",
         )
 
     def test_dark_with_dark_tiles_carries_a_query(self) -> None:

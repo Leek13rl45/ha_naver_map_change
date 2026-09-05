@@ -23,10 +23,14 @@ from custom_components.naver_map_change.const import (
 from upstream import (
     TILE_BODY,
     TILE_BODY_2X,
+    TILE_BODY_DARK,
+    TILE_BODY_DARK_2X,
     TILEJSON_URL,
     VERSION,
     tile_url,
     tile_url_2x,
+    tile_url_dark,
+    tile_url_dark_2x,
 )
 
 TILE_PATH = "/api/map_tiles/naver_map_change/12/3492/1586.png"
@@ -269,12 +273,144 @@ async def test_ac6_style_document_has_no_secret_and_needs_no_token(
 
 
 async def test_style_dark_variant(hass: HomeAssistant, client: Any) -> None:
-    """Naver has no dark tiles, so dark returns the same tile template."""
+    """Design decision D15, correcting finding F8.
+
+    Naver does have a dark family (the dbasic style), so the dark style
+    document must now point the route at it with ?variant=dark. Before D15 this
+    test asserted the *light* template, because url_template_dark was None.
+    """
     dark = await client.get("/api/map_tiles/naver_map_change/style/dark.json")
     assert dark.status == HTTPStatus.OK
-    assert (await dark.json())["sources"]["basemap"]["tiles"] == [
-        "/api/map_tiles/naver_map_change/{z}/{x}/{y}.png"
+    style = await dark.json()
+    assert style["sources"]["basemap"]["tiles"] == [
+        "/api/map_tiles/naver_map_change/{z}/{x}/{y}.png?variant=dark"
     ]
+    # Still a plain raster source at the same geometry - only the bytes differ.
+    assert style["sources"]["basemap"]["tileSize"] == 256
+    assert style["sources"]["basemap"]["attribution"] == "© NAVER"
+
+
+async def test_style_dark_at_dpr_two_combines_both_queries(
+    hass: HomeAssistant, client: Any
+) -> None:
+    """?variant=dark and ?scale=2 have to coexist on one route.
+
+    They join with "&" because the route is a single aiohttp registration and
+    core's withMapTilesToken() appends its token onto whatever query is already
+    there (docs/02 section 3.3).
+    """
+    dark = await client.get("/api/map_tiles/naver_map_change/style/dark.json?dpr=2")
+    assert dark.status == HTTPStatus.OK
+    style = await dark.json()
+    assert style["sources"]["basemap"]["tiles"] == [
+        "/api/map_tiles/naver_map_change/{z}/{x}/{y}.png?variant=dark&scale=2"
+    ]
+    # The tileSize invariant holds for the dark family too (D12).
+    assert style["sources"]["basemap"]["tileSize"] == 256
+
+
+async def test_style_dark_with_the_dark_option_off_uses_light_tiles(
+    hass: HomeAssistant,
+    hass_client_no_auth: Any,
+    mock_upstream: Any,
+    config_entry: MockConfigEntry,
+) -> None:
+    """CONF_DARK_VARIANT keeps its veto now that naver has real dark tiles."""
+    from custom_components.naver_map_change.const import CONF_DARK_VARIANT
+
+    config_entry.add_to_hass(hass)
+    hass.config_entries.async_update_entry(
+        config_entry, options={CONF_DARK_VARIANT: False}
+    )
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    client = await hass_client_no_auth()
+
+    # The runtime refuses the dark template, so the tile route serves light.
+    response = await client.get(
+        f"{TILE_PATH}?variant=dark&token={_token(hass)}"
+    )
+    assert response.status == HTTPStatus.OK
+    assert await response.read() == TILE_BODY
+
+
+async def test_dark_tile_route_fetches_the_dbasic_family(
+    hass: HomeAssistant, client: Any, mock_upstream: Any
+) -> None:
+    """D15: ?variant=dark reaches upstream as the dbasic style."""
+    response = await client.get(f"{TILE_PATH}?variant=dark&token={_token(hass)}")
+    assert response.status == HTTPStatus.OK
+    assert await response.read() == TILE_BODY_DARK
+    requested = [str(call[1]) for call in mock_upstream.mock_calls]
+    assert tile_url_dark() in requested
+    assert tile_url() not in requested
+
+
+async def test_dark_and_scale_two_select_the_dark_retina_template(
+    hass: HomeAssistant, client: Any, mock_upstream: Any
+) -> None:
+    """The two query parameters combine rather than one overriding the other.
+
+    This is the D12 x D15 intersection: dark picks the family, scale picks the
+    resolution, and the result must be the dbasic @2x template - not the light
+    @2x one and not the dark 1x one.
+    """
+    response = await client.get(
+        f"{TILE_PATH}?variant=dark&scale=2&token={_token(hass)}"
+    )
+    assert response.status == HTTPStatus.OK
+    assert await response.read() == TILE_BODY_DARK_2X
+    requested = [str(call[1]) for call in mock_upstream.mock_calls]
+    assert tile_url_dark_2x() in requested
+    for other in (tile_url(), tile_url_2x(), tile_url_dark()):
+        assert other not in requested
+
+
+async def test_all_four_variants_are_cached_separately(
+    hass: HomeAssistant, client: Any, config_entry: MockConfigEntry
+) -> None:
+    """variant and scale are both in the cache key, so none of the four mix."""
+    token = _token(hass)
+    expected = {
+        "": TILE_BODY,
+        "?scale=2": TILE_BODY_2X,
+        "?variant=dark": TILE_BODY_DARK,
+        "?variant=dark&scale=2": TILE_BODY_DARK_2X,
+    }
+    for query, body in expected.items():
+        joiner = "&" if query else "?"
+        response = await client.get(f"{TILE_PATH}{query}{joiner}token={token}")
+        assert await response.read() == body, query
+    assert len(config_entry.runtime_data.cache) == 4
+
+    # A second pass must hit each entry's own body, never a neighbour's.
+    for query, body in expected.items():
+        joiner = "&" if query else "?"
+        response = await client.get(f"{TILE_PATH}{query}{joiner}token={token}")
+        assert await response.read() == body, query
+    assert len(config_entry.runtime_data.cache) == 4
+
+
+async def test_ac6_dark_style_leaks_no_upstream_detail(
+    hass: HomeAssistant, client: Any
+) -> None:
+    """AC6 regression: the dark style name must not reach the browser either."""
+    response = await client.get(
+        "/api/map_tiles/naver_map_change/style/dark.json?dpr=2"
+    )
+    body = await response.text()
+    for forbidden in (
+        "dbasic",
+        "pstatic.net",
+        "vworld.kr",
+        "api_key",
+        VERSION,
+        "mt=",
+        "bg.ol.ts.ar.lko",
+        "@2x",
+        ".jpg",
+    ):
+        assert forbidden not in body
 
 
 async def test_unknown_style_variant_is_404(hass: HomeAssistant, client: Any) -> None:
@@ -537,8 +673,8 @@ async def test_scale_and_variant_and_token_coexist_on_one_route(
         f"{TILE_PATH}?variant=dark&scale=2&token={_token(hass)}"
     )
     assert response.status == HTTPStatus.OK
-    # Naver has no dark family, so dark reuses the light @2x tiles (F8).
-    assert await response.read() == TILE_BODY_2X
+    # Since D15 corrected F8, this is the *dark* @2x body, not the light one.
+    assert await response.read() == TILE_BODY_DARK_2X
 
 
 async def test_injected_module_is_served(hass: HomeAssistant, client: Any) -> None:

@@ -85,11 +85,30 @@ PROVIDER_OSM = "osm"
 PROVIDER_VWORLD = "vworld"
 PROVIDER_CUSTOM = "custom"
 
-# The upstream path, assembled once so the 1x and 2x templates cannot drift
-# apart. ``mt`` is the layer selector; its measured per-component byte counts
-# are tabulated on NAVER_MAP_TYPES in const.py (design decision D14).
-_NAVER_BASE = "https://map.pstatic.net/nrb/styles/basic/{version}/{z}/{x}/{y}"
+# The four naver templates are assembled from one shape, with the style name as
+# the only variable, so light/dark and 1x/2x can never drift apart. ``mt`` is
+# the layer selector; its measured per-component byte counts are tabulated on
+# NAVER_MAP_TYPES in const.py (design decision D14).
 _NAVER_QUERY = f"?{NAVER_MAP_TYPES_QUERY}={NAVER_MAP_TYPES}"
+
+
+def _naver_template(style: str, *, retina: bool = False) -> str:
+    """Return the naver tile template for one style family and scale."""
+    suffix = "@2x.png" if retina else ".png"
+    return (
+        f"https://map.pstatic.net/nrb/styles/{style}"
+        f"/{{version}}/{{z}}/{{x}}/{{y}}{suffix}{_NAVER_QUERY}"
+    )
+
+
+# Kept as names so the two style families are visible at a glance.
+_NAVER_STYLE_LIGHT = "basic"
+# Design decision D15. The dark family exists; finding F8 ("no dark family")
+# was simply wrong - the prefix is "d", which the original survey never tried.
+# ``dterrain`` also answers 200 but is not used here: this integration serves
+# the ``basic`` family only. ``dsatellite``/``dhybrid``/``dnavi``/``dbasic_ko``
+# are 404 (docs/05-UPSTREAM-FINDINGS.md section 1, F8 correction).
+_NAVER_STYLE_DARK = "dbasic"
 
 _NAVER = TileProvider(
     id=PROVIDER_NAVER,
@@ -104,19 +123,25 @@ _NAVER = TileProvider(
     # ``?mt=`` (design decision D14): without it upstream composes its own
     # default layer set, which measurably is *not* the same tile - bus stops,
     # subway exits and transit detail are missing from it.
-    url_template=f"{_NAVER_BASE}.png{_NAVER_QUERY}",
-    url_template_dark=None,  # F8: no dark style family exists, light is reused.
+    url_template=_naver_template(_NAVER_STYLE_LIGHT),
+    # Design decision D15, correcting finding F8. Measured 200 image/png,
+    # 19,444 bytes at 1x and 53,195 bytes at @2x, carrying the same Korean
+    # labels, bus stops, subway exits and line colours as the light family.
+    url_template_dark=_naver_template(_NAVER_STYLE_DARK),
     # Measured: 200 image/png, 50,772 bytes, `file` reports 512x512
     # (docs/05-UPSTREAM-FINDINGS.md section 3).
-    url_template_retina=f"{_NAVER_BASE}@2x.png{_NAVER_QUERY}",
-    # No dark family at all, so there is no dark @2x either (F8).
-    url_template_dark_retina=None,
+    url_template_retina=_naver_template(_NAVER_STYLE_LIGHT, retina=True),
+    url_template_dark_retina=_naver_template(_NAVER_STYLE_DARK, retina=True),
     headers={},  # F2: measured 200 with zero headers.
     attribution="© NAVER",
     min_zoom=0,  # TileJSON minzoom
     max_zoom=20,  # aligned with core MAP_MAX_ZOOM
     max_native_zoom=21,  # TileJSON maxzoom (findings section 4)
     tile_size=256,
+    # One refresher covers both families: ``dbasic.json`` publishes the *same*
+    # version code as ``basic.json`` (measured, D15), and dbasic's TileJSON is
+    # otherwise identical too - minzoom 0, maxzoom 21. A second refresher would
+    # be a second upstream call for a value we already have.
     version_meta_url="https://map.pstatic.net/nrb/styles/basic.json",
 )
 

@@ -37,8 +37,15 @@ MAP_TYPES_QUERY = "?mt=bg.ol.ts.ar.lko"
 TILE_BODY = b"\xff\xd8\xff\xd9tile-bytes"
 
 
-# A distinct body, so a test can tell which of the two resolutions was served.
+# Distinct bodies, so a test can tell which of the four variants was served.
 TILE_BODY_2X = b"\xff\xd8\xff\xd9tile-bytes-at-2x-which-is-larger"
+TILE_BODY_DARK = b"\xff\xd8\xff\xd9dark-tile-bytes"
+TILE_BODY_DARK_2X = b"\xff\xd8\xff\xd9dark-tile-bytes-at-2x-which-is-larger"
+
+# The dark style family (design decision D15, correcting finding F8). Its
+# TileJSON publishes the same version code as basic.json, so the tests reuse
+# VERSION here exactly as production reuses the one refresher.
+DARK_STYLE = "dbasic"
 
 
 def tile_url(version: str = VERSION, z: int = 12, x: int = 3492, y: int = 1586) -> str:
@@ -52,4 +59,20 @@ def tile_url_2x(
 ) -> str:
     """Return the upstream naver @2x tile URL (docs/05 section 3, D12-D14)."""
     base = f"https://map.pstatic.net/nrb/styles/basic/{version}/{z}/{x}/{y}"
+    return f"{base}@2x.png{MAP_TYPES_QUERY}"
+
+
+def tile_url_dark(
+    version: str = VERSION, z: int = 12, x: int = 3492, y: int = 1586
+) -> str:
+    """Return the upstream naver dark 1x tile URL (design decision D15)."""
+    base = f"https://map.pstatic.net/nrb/styles/{DARK_STYLE}/{version}/{z}/{x}/{y}"
+    return f"{base}.png{MAP_TYPES_QUERY}"
+
+
+def tile_url_dark_2x(
+    version: str = VERSION, z: int = 12, x: int = 3492, y: int = 1586
+) -> str:
+    """Return the upstream naver dark @2x tile URL (D12 + D15)."""
+    base = f"https://map.pstatic.net/nrb/styles/{DARK_STYLE}/{version}/{z}/{x}/{y}"
     return f"{base}@2x.png{MAP_TYPES_QUERY}"

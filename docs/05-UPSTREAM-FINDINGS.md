@@ -17,7 +17,7 @@
 | F5 | 좌표 범위 초과 시 404 예상 | **200 + 빈 타일**을 반환한다 | 좌표 검증을 프록시가 직접 해야 한다(upstream 이 걸러주지 않는다) |
 | F6 | 버전코드 만료 동작 미상 | 잘못된 version → **HTTP 400, 본문 0바이트** | 400 을 "버전 만료" 신호로 쓴다. 즉시 갱신 트리거 후보 |
 | F7 | `basic.json` 구조 미상 | **TileJSON 2.1.0.** `version` 필드 + `tiles[]` 템플릿까지 들어 있다 | 갱신기가 URL 템플릿까지 신뢰 가능. `scheme: "xyz"` 로 표준 확인 |
-| F8 | 다크 타일 유무 미상 | `basic`/`satellite`/`terrain` 만 존재. **dark 계열 없음** | naver 는 `url_template_dark = None` → light 스타일 재사용 (`03` §3.4 규정대로) |
+| F8 | 다크 타일 유무 미상 | ~~`basic`/`satellite`/`terrain` 만 존재. **dark 계열 없음**~~ | 🚨 **이 결론은 오류였다(v2.2.0, D15). 다크 계열은 존재한다 — 접두사가 `d` 다(`dbasic`).** §1 의 F8 정정 참조 |
 
 ---
 
@@ -80,6 +80,75 @@ vector       404  0
 > **설계 반영**: naver provider 를 `style` 파라미터(`basic`|`satellite`|`terrain`)로 확장할 수 있다.
 > `03` 명세 범위 밖이므로 **1차 구현에서는 `basic` 고정**하되, URL 템플릿에 스타일명을
 > 하드코딩하지 말고 provider 정의로 분리해 둔다.
+
+---
+
+### 🚨 F8 정정 (v2.2.0) — "dark 계열 없음" 은 **오류였다**
+
+원래 서술을 지우지 않는다. 아래가 사실이다.
+
+**무엇을 잘못했나.** 위 `for s in ...` 목록에 **`d` 접두사 이름을 하나도 넣지 않았다.**
+`dark`/`night`/`gray`/`light`/`basic_ko` 같은 *영어 단어* 후보만 찍어보고 404 가 나오자
+"dark 계열 없음" 으로 단정했다. 404 는 "그 이름이 없다" 는 뜻이지 "그런 계열이 없다" 는 뜻이 아닌데
+전자를 후자로 읽었다. **네이밍 규칙을 추측으로 좁힌 채 부정형 결론을 내린 것이 실수다.**
+
+**어떻게 찾았나.** 이름을 더 찍어보는 대신, 네이버 지도 웹(`map.naver.com`)을 브라우저로 열어
+다크 모드에서 **실제로 나가는 요청을 관찰**했다. 사용자가 "다크 타일이 있다" 고 지적한 것이 계기다.
+
+```
+https://map.pstatic.net/nrb/styles/dbasic@2x.json?fmt=png&callback=...
+https://map.pstatic.net/nrb/styles/dterrain@2x.json?fmt=png&callback=...
+```
+
+접두사는 `d` 였다.
+
+#### 실측 [실측]
+
+```console
+$ curl -s https://map.pstatic.net/nrb/styles/dbasic.json
+{"tilejson":"2.1.0",...,"scheme":"xyz","minzoom":0,"maxzoom":21,
+ "version":"1788514292","format":"jpg",
+ "tiles":["https://map.pstatic.net/nrb/styles/dbasic/1788514292/{z}/{x}/{y}.jpg"]}
+```
+
+| 항목 | 결과 |
+|---|---|
+| `dbasic` | **200** — tilejson 구조·minzoom 0·maxzoom 21 전부 light `basic` 과 동일 |
+| `dterrain` | 200 |
+| `dsatellite` / `dhybrid` / `dnavi` / `dbasic_ko` | 404 |
+| **version** | `1788514292` — **light `basic` 과 완전히 동일한 값** |
+| `dbasic/{v}/17/111785/50789.png?mt=bg.ol.ts.ar.lko` | 200 `image/png` 19,444B |
+| `dbasic/{v}/17/111785/50789@2x.png?mt=bg.ol.ts.ar.lko` | 200 `image/png` **53,195B** |
+| `mt` 없이 | 200 19,541B (동작하지만 붙인다) |
+
+타일 이미지를 눈으로 확인했다: 어두운 배경에 **한글 라벨·버스정류장·지하철출구·노선색이 light 와
+동일하게** 들어 있다.
+
+#### 존재 확인된 스타일 계열 (정정본)
+
+| 스타일 | 응답 | 비고 |
+|---|---|---|
+| `basic` | 200 | light 기본. **현재 사용 중** |
+| `satellite` | 200 | 미사용 |
+| `terrain` | 200 | 미사용 |
+| **`dbasic`** | **200** | **dark 기본. v2.2.0 부터 사용 중** |
+| `dterrain` | 200 | 미사용. 존재만 기록한다 |
+| `hybrid`, `dark`, `night`, `gray`, `light`, `basic_ko`, `vector` | 404 | 최초 조사에서 시도한 이름들 |
+| `dsatellite`, `dhybrid`, `dnavi`, `dbasic_ko` | 404 | 정정 조사에서 시도한 `d` 접두사 이름들 |
+
+#### 설계 반영 (D15)
+
+- **version 이 light 와 같다는 점이 핵심이다.** 기존 `version_meta_url`(= `basic.json`) 갱신기가 다크
+  타일까지 그대로 커버한다. **별도 갱신기를 만들지 않았다.**
+- 다크 인프라(`url_template_dark`, `url_template_dark_retina`, `?variant=dark` 라우트,
+  `CONF_DARK_VARIANT` 옵션, `_select_template` 의 variant 분기)는 F8 을 믿고도 이미 구조로 만들어
+  두었으므로, **템플릿 두 개를 채우는 것으로 끝났다.** 부정형 실측 결론에 구조까지 맞추지 않은 것이
+  결과적으로 옳았다.
+- 네 템플릿(light/dark x 1x/2x)은 **스타일명만 바꿔 한 곳에서 조립**한다
+  (`providers.py` 의 `_naver_template()`). 서로 어긋날 수 없다.
+- `dterrain` 은 사용하지 않는다. 이 통합은 `basic` 계열만 쓴다.
+- `dbasic` 이라는 스타일명은 upstream 구현 세부사항이므로 **스타일 JSON 으로 새어나가지 않아야
+  한다**(AC6). 브라우저에는 `?variant=dark` 만 보인다.
 
 ---
 
@@ -426,12 +495,15 @@ url_template_dark = None     # F8: dark 계열 없음 → light 재사용
 ```
 
 ```python
-# providers.py — naver (v2.1.0, 현재 유효 — §3 정정 참조)
+# providers.py — naver (v2.2.0, 현재 유효 — §3 정정 및 §1 F8 정정 참조)
 NAVER_MAP_TYPES = "bg.ol.ts.ar.lko"        # const.py. 성분별 실측표는 §3 정정에
-url_template        = ".../basic/{version}/{z}/{x}/{y}.png?mt=bg.ol.ts.ar.lko"     # D13+D14
-url_template_retina = ".../basic/{version}/{z}/{x}/{y}@2x.png?mt=bg.ol.ts.ar.lko"  # D12+D13+D14
-url_template_dark_retina = None            # F8: dark 계열이 없으므로 dark @2x 도 없다
+# 네 템플릿은 스타일명만 바꿔 한 곳(_naver_template())에서 조립한다.
+url_template             = ".../basic/{version}/{z}/{x}/{y}.png?mt=..."       # D13+D14
+url_template_retina      = ".../basic/{version}/{z}/{x}/{y}@2x.png?mt=..."    # D12+D13+D14
+url_template_dark        = ".../dbasic/{version}/{z}/{x}/{y}.png?mt=..."      # D15 (F8 정정)
+url_template_dark_retina = ".../dbasic/{version}/{z}/{x}/{y}@2x.png?mt=..."   # D12+D15
 tile_size      = 256         # ★ scale 2 에서도 256. 512 로 바꾸면 줌 피라미드가 밀린다
+version_meta_url = ".../basic.json"   # dbasic.json 이 같은 version 을 주므로 갱신기는 하나뿐
 # 나머지 필드는 위 블록과 동일하다.
 ```
 
@@ -464,6 +536,8 @@ attribution  = "© 국토교통부 공간정보 오픈플랫폼(VWorld)"
 - [ ] `mt=bg.ol.ts.ar.lko` 를 붙인다. 값은 `const.py` 상수 하나에서만 온다 (§3 정정, D14)
 - [ ] `@2x` 를 dpr 인식으로 붙인다. **`tileSize` 는 256 을 유지한다** (§3 정정, D12)
 - [ ] 캐시 키에 `scale` 포함 → 1x/2x 가 섞이지 않는다 (§3 정정, D12)
+- [ ] 다크는 `dbasic` 계열을 쓴다. 갱신기는 하나뿐이다 (§1 F8 정정, D15)
+- [ ] 캐시 키의 `variant` 가 light/dark 를 분리한다 → 네 조합이 섞이지 않는다 (D9+D12+D15)
 
 ---
 

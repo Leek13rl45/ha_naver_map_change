@@ -31,10 +31,14 @@ from custom_components.naver_map_change.const import (  # noqa: E402
 from upstream import (  # noqa: E402
     TILE_BODY,
     TILE_BODY_2X,
+    TILE_BODY_DARK,
+    TILE_BODY_DARK_2X,
     TILEJSON_BODY,
     TILEJSON_URL,
     tile_url,
     tile_url_2x,
+    tile_url_dark,
+    tile_url_dark_2x,
 )
 
 
@@ -64,6 +68,18 @@ def mock_upstream(aioclient_mock: Any) -> Any:
     aioclient_mock.get(
         tile_url_2x(),
         content=TILE_BODY_2X,
+        headers={"Content-Type": "image/png", "Cache-Control": "max-age=31536000"},
+    )
+    # The dark family at both scales (design decision D15). Four distinct
+    # bodies in total, so no test can pass by serving the wrong one.
+    aioclient_mock.get(
+        tile_url_dark(),
+        content=TILE_BODY_DARK,
+        headers={"Content-Type": "image/png", "Cache-Control": "max-age=31536000"},
+    )
+    aioclient_mock.get(
+        tile_url_dark_2x(),
+        content=TILE_BODY_DARK_2X,
         headers={"Content-Type": "image/png", "Cache-Control": "max-age=31536000"},
     )
     return aioclient_mock
