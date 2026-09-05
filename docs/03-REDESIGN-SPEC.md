@@ -14,6 +14,11 @@
 > - §3.6 `StaticPathConfig(should_cache=...)` → 실제 인자명은 `cache_headers`
 > - §3.6 "`add_extra_js_url` 은 해제 API 가 없다" → `remove_extra_js_url` 이 **존재한다**
 > - §3.8 `manifest.json` 예시의 키 순서 → hassfest 가 요구하는 `domain`, `name`, 알파벳순이 아니다
+> - §3.2/§3.4 의 dark 관련 서술과 `05` 의 **F8("네이버에 dark 계열 없음")** → 🚨 **오류다.**
+>   다크 계열은 존재하며 스타일명 접두사가 `d` 다(`dbasic`). 최초 조사가 `dark`/`night`/`gray` 같은
+>   영어 단어 후보만 찍어보고 404 를 "계열 없음" 으로 읽은 것이 원인이다. v2.2.0(D15)에서
+>   `url_template_dark` / `url_template_dark_retina` 를 `dbasic` 으로 채웠다.
+>   근거와 실측표는 `05` §1 의 "F8 정정" 에 있다.
 
 ---
 
